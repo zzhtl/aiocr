@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aiocr-core",
+    "crates/aiocr-train",
+    "crates/aiocr-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# ML 框架 (0.21.0-pre.3 修复了 candle-core 兼容性问题)
+burn = { version = "0.21.0-pre.3", features = ["ndarray"] }
+burn-store = "0.21.0-pre.3"
+
+# 纯 Rust ONNX 推理引擎，无需外部库，支持直接加载 .onnx 文件
+tract-onnx = "0.21"
+
+# 轻量级同步 HTTP 客户端（用于模型下载），纯 Rust TLS
+ureq = { version = "2", features = ["tls"] }
+
+# 图片处理
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# GUI
+eframe = "0.31"
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+
+# 工具
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+arboard = "3.6"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.aiocr-core]
+opt-level = 3

@@ -1,0 +1,20 @@
+[package]
+name = "aiocr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+burn.workspace = true
+burn-store.workspace = true
+tract-onnx.workspace = true
+image.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+burn-onnx = "0.21.0-pre.3"
+tract-onnx.workspace = true
+prost = "0.11"
