@@ -384,8 +384,8 @@ impl eframe::App for AiocrApp {
 impl AiocrApp {
     fn show_ocr_tab(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("right_panel")
-            .default_width(460.0)
-            .min_width(360.0)
+            .default_width(560.0)
+            .min_width(420.0)
             .max_width(720.0)
             .show(ctx, |ui| {
                 egui::TopBottomPanel::bottom("ocr_control_panel")

@@ -320,6 +320,165 @@ fn build_full_text(regions: &[types::TextRegion]) -> String {
     full_text
 }
 
+/// 按文本框在原图中的相对位置重建可复制的版式文本。
+///
+/// `build_full_text` 更偏向连续阅读顺序；这个函数保留水平缩进和较大的纵向空白，
+/// 用于表格、票据、截图等复杂格式的结果展示。
+pub fn build_spatial_text(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    image_height: f32,
+) -> String {
+    if regions.is_empty() {
+        return String::new();
+    }
+
+    let mut regions = regions.to_vec();
+    regions.sort_by(|left, right| {
+        left.bbox
+            .top()
+            .partial_cmp(&right.bbox.top())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.bbox
+                    .left()
+                    .partial_cmp(&right.bbox.left())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let lines = group_regions_by_line(&regions);
+    let char_width = estimate_spatial_char_width(&regions, image_width);
+    let line_pitch = estimate_spatial_line_pitch(&lines, image_height);
+    let min_left = regions
+        .iter()
+        .map(|region| region.bbox.left())
+        .fold(f32::MAX, f32::min)
+        .max(0.0);
+
+    let mut output = String::new();
+    let mut previous_center_y: Option<f32> = None;
+
+    for line in lines {
+        if let Some(previous) = previous_center_y {
+            let gap = (line_center_y(&line) - previous).max(0.0);
+            let blank_lines = ((gap / line_pitch).round() as isize - 1)
+                .max(0)
+                .min(16) as usize;
+            for _ in 0..blank_lines {
+                output.push('\n');
+            }
+        }
+
+        if !output.is_empty() {
+            output.push('\n');
+        }
+
+        output.push_str(&build_spatial_line(&line, min_left, char_width));
+        previous_center_y = Some(line_center_y(&line));
+    }
+
+    output
+}
+
+fn estimate_spatial_char_width(regions: &[types::TextRegion], image_width: f32) -> f32 {
+    let mut samples = regions
+        .iter()
+        .filter_map(|region| {
+            let chars = region.text.chars().count().max(1) as f32;
+            let width = region.bbox.width() / chars;
+            (width.is_finite() && width > 0.0).then_some(width)
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+
+    let median = if samples.is_empty() {
+        10.0
+    } else {
+        samples[samples.len() / 2]
+    };
+    let max_columns = 160.0;
+    let width_for_limit = if image_width.is_finite() && image_width > 0.0 {
+        image_width / max_columns
+    } else {
+        1.0
+    };
+
+    median.max(width_for_limit).max(1.0)
+}
+
+fn estimate_spatial_line_pitch(
+    lines: &[Vec<&types::TextRegion>],
+    image_height: f32,
+) -> f32 {
+    let mut deltas = lines
+        .windows(2)
+        .filter_map(|pair| {
+            let delta = line_center_y(&pair[1]) - line_center_y(&pair[0]);
+            (delta.is_finite() && delta > 0.0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+
+    if !deltas.is_empty() {
+        let sample_len = deltas.len().div_ceil(2);
+        let sample = &deltas[..sample_len];
+        return sample[sample.len() / 2].max(1.0);
+    }
+
+    let avg_height = lines
+        .iter()
+        .flat_map(|line| line.iter().map(|region| region.bbox.height()))
+        .sum::<f32>()
+        / lines.iter().map(Vec::len).sum::<usize>().max(1) as f32;
+
+    avg_height
+        .max((image_height / 80.0).max(1.0))
+        .max(1.0)
+}
+
+fn build_spatial_line(
+    line: &[&types::TextRegion],
+    min_left: f32,
+    char_width: f32,
+) -> String {
+    let mut line = line.to_vec();
+    line.sort_by(|left, right| {
+        left.bbox
+            .left()
+            .partial_cmp(&right.bbox.left())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut output = String::new();
+    let mut cursor = 0usize;
+
+    for region in line {
+        let target_col = ((region.bbox.left() - min_left) / char_width)
+            .round()
+            .max(0.0)
+            .min(240.0) as usize;
+        if target_col > cursor {
+            output.extend(std::iter::repeat_n(' ', target_col - cursor));
+        } else if !output.is_empty() && !output.ends_with(' ') {
+            output.push(' ');
+        }
+
+        let text = region.text.trim();
+        output.push_str(text);
+        cursor = output.chars().count();
+    }
+
+    output.trim_end().to_string()
+}
+
+fn line_center_y(line: &[&types::TextRegion]) -> f32 {
+    line.iter()
+        .map(|region| region.bbox.center_y())
+        .sum::<f32>()
+        / line.len().max(1) as f32
+}
+
 #[derive(Debug, Clone)]
 struct ReconstructedLine {
     center_y: f32,
@@ -762,6 +921,52 @@ mod tests {
             build_full_text(&regions),
             "1  # AIOCR\n2\n3  纯 Rust OCR\n4  - item"
         );
+    }
+
+    #[test]
+    fn test_build_spatial_text_preserves_columns_and_large_vertical_gaps() {
+        let regions = vec![
+            TextRegion {
+                bbox: BoundingBox::from_rect(20.0, 10.0, 40.0, 12.0),
+                confidence: 0.9,
+                text: "姓名".to_string(),
+                direction: TextDirection::Horizontal,
+            },
+            TextRegion {
+                bbox: BoundingBox::from_rect(180.0, 10.0, 60.0, 12.0),
+                confidence: 0.9,
+                text: "金额".to_string(),
+                direction: TextDirection::Horizontal,
+            },
+            TextRegion {
+                bbox: BoundingBox::from_rect(20.0, 50.0, 60.0, 12.0),
+                confidence: 0.9,
+                text: "张三".to_string(),
+                direction: TextDirection::Horizontal,
+            },
+            TextRegion {
+                bbox: BoundingBox::from_rect(180.0, 50.0, 80.0, 12.0),
+                confidence: 0.9,
+                text: "128.00".to_string(),
+                direction: TextDirection::Horizontal,
+            },
+            TextRegion {
+                bbox: BoundingBox::from_rect(20.0, 130.0, 80.0, 12.0),
+                confidence: 0.9,
+                text: "备注".to_string(),
+                direction: TextDirection::Horizontal,
+            },
+        ];
+
+        let text = build_spatial_text(&regions, 320.0, 180.0);
+
+        assert!(text.contains("姓名"));
+        assert!(text.contains("金额"));
+        assert!(text.contains("张三"));
+        assert!(text.contains("128.00"));
+        assert!(text.contains("\n\n备注"));
+        let first_line = text.lines().next().unwrap_or_default();
+        assert!(first_line.find("金额").unwrap() > first_line.find("姓名").unwrap());
     }
 
     #[test]

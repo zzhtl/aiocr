@@ -1,3 +1,4 @@
+use aiocr_core::build_spatial_text;
 use aiocr_core::types::TextDirection;
 use egui::{RichText, ScrollArea, TextEdit, Ui};
 
@@ -12,35 +13,69 @@ pub fn show(ui: &mut Ui, state: &AppState) {
     ui.separator();
 
     if let Some(result) = &state.ocr_result {
+        let spatial_text = state
+            .image_data
+            .as_ref()
+            .map(|image| {
+                build_spatial_text(
+                    &result.regions,
+                    image.width() as f32,
+                    image.height() as f32,
+                )
+            })
+            .unwrap_or_else(|| result.full_text.clone());
+
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("检测到 {} 个文本区域", result.regions.len()));
             ui.separator();
             ui.label(format!("耗时 {}ms", result.elapsed_ms));
             ui.separator();
 
+            if ui.button("复制版式").clicked() {
+                ui.ctx().copy_text(spatial_text.clone());
+            }
             if ui.button("复制全部").clicked() {
                 ui.ctx().copy_text(result.full_text.clone());
             }
         });
         ui.add_space(8.0);
 
-        ui.label(RichText::new("完整文本").strong());
-        let mut text = result.full_text.clone();
+        ui.label(RichText::new("版式预览").strong());
+        let mut layout_text = spatial_text;
         let available_height = ui.available_height();
-        let full_text_height = (available_height * 0.4)
+        let layout_text_height = (available_height * 0.48)
             .min(MAX_FULL_TEXT_HEIGHT)
             .max(MIN_FULL_TEXT_HEIGHT.min(available_height * 0.6));
         ScrollArea::both()
-            .id_salt("ocr_full_text_scroll")
-            .max_height(full_text_height)
+            .id_salt("ocr_spatial_text_scroll")
+            .max_height(layout_text_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add(
-                    TextEdit::multiline(&mut text)
+                    TextEdit::multiline(&mut layout_text)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
                         .code_editor(),
                 );
+            });
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("完整文本")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut text = result.full_text.clone();
+                ScrollArea::both()
+                    .id_salt("ocr_full_text_scroll")
+                    .max_height(140.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut text)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor(),
+                        );
+                    });
             });
 
         ui.add_space(8.0);

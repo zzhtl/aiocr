@@ -182,10 +182,22 @@ impl Trainer {
             load_train_model::<TrainBackend>(&device, base_model.weights_path.as_deref())?;
         let mut optimizer = AdamWConfig::new().init::<TrainBackend, TrainModel>();
 
-        let mut best_accuracy = f32::MIN;
+        let initial_model = model.valid();
+        let initial_accuracy = evaluate_accuracy::<InferBackend, InferModel>(
+            &initial_model,
+            decoder_ref(&decoder),
+            &validation_items,
+        )?;
+
+        let mut best_accuracy = initial_accuracy;
         let mut best_loss = f32::MAX;
-        let mut best_bytes: Option<Vec<u8>> = None;
-        let mut best_metrics: Option<AiModelMetrics> = None;
+        let mut best_bytes: Option<Vec<u8>> = Some(save_model_bytes(&initial_model)?);
+        let mut best_metrics: Option<AiModelMetrics> = Some(AiModelMetrics {
+            train_samples: train_items.len(),
+            validation_samples: validation_items.len(),
+            accuracy: initial_accuracy,
+            avg_loss: 0.0,
+        });
 
         for epoch in 1..=self.config.num_epochs.max(1) {
             check_cancel(cancel_flag)?;
