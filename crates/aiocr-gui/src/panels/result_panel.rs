@@ -1,4 +1,3 @@
-use aiocr_core::build_spatial_text;
 use aiocr_core::types::TextDirection;
 use egui::{RichText, ScrollArea, TextEdit, Ui};
 
@@ -14,16 +13,9 @@ pub fn show(ui: &mut Ui, state: &AppState) {
 
     if let Some(result) = &state.ocr_result {
         let spatial_text = state
-            .image_data
-            .as_ref()
-            .map(|image| {
-                build_spatial_text(
-                    &result.regions,
-                    image.width() as f32,
-                    image.height() as f32,
-                )
-            })
-            .unwrap_or_else(|| result.full_text.clone());
+            .spatial_text
+            .as_deref()
+            .unwrap_or(&result.full_text);
 
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("检测到 {} 个文本区域", result.regions.len()));
@@ -32,7 +24,7 @@ pub fn show(ui: &mut Ui, state: &AppState) {
             ui.separator();
 
             if ui.button("复制版式").clicked() {
-                ui.ctx().copy_text(spatial_text.clone());
+                ui.ctx().copy_text(spatial_text.to_string());
             }
             if ui.button("复制全部").clicked() {
                 ui.ctx().copy_text(result.full_text.clone());
@@ -41,7 +33,7 @@ pub fn show(ui: &mut Ui, state: &AppState) {
         ui.add_space(8.0);
 
         ui.label(RichText::new("版式预览").strong());
-        let mut layout_text = spatial_text;
+        let mut layout_text = spatial_text.to_string();
         let available_height = ui.available_height();
         let layout_text_height = (available_height * 0.48)
             .min(MAX_FULL_TEXT_HEIGHT)

@@ -3,7 +3,7 @@
 //! 使用 tract-onnx 直接加载和推理 ONNX 格式模型文件，
 //! 无需编译时转换，支持任意 PaddleOCR 兼容的检测/识别模型。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -267,7 +267,8 @@ impl Detector for OnnxDetector {
 /// 基于 ONNX 运行时的文本识别器（SVTR/CRNN+CTC）
 pub struct OnnxRecognizer {
     proto: pb::ModelProto,
-    plans: Mutex<HashMap<usize, OcrPlan>>,
+    /// 推理计划缓存，按 (batch_size, width) 复用，避免重复构建 tract 计划。
+    plans: Mutex<HashMap<(usize, usize), OcrPlan>>,
     decoder: CtcDecoder,
     model_name: String,
 }
@@ -287,6 +288,33 @@ impl OnnxRecognizer {
             model_name: model_name.into(),
         })
     }
+
+    /// 对指定 (batch_size, width) 的输入执行推理，按需构建并缓存计划。
+    fn infer_batch(
+        &self,
+        data: Vec<f32>,
+        batch_size: usize,
+        width: usize,
+    ) -> Result<(Vec<f32>, Vec<usize>), OcrError> {
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|err| OcrError::Inference(format!("锁定识别 ONNX 计划缓存失败: {err}")))?;
+        let key = (batch_size, width);
+        if !plans.contains_key(&key) {
+            let plan = build_plan_from_proto(
+                &self.proto,
+                &[batch_size, 3, 48, width],
+                &format!("rec[{batch_size}x48x{width}]"),
+            )?;
+            plans.insert(key, plan);
+        }
+        let plan = plans
+            .get(&key)
+            .ok_or_else(|| OcrError::Inference("识别 ONNX 计划缓存缺失".to_string()))?;
+
+        infer(plan, data, &[batch_size, 3, 48, width])
+    }
 }
 
 impl Recognizer for OnnxRecognizer {
@@ -294,28 +322,74 @@ impl Recognizer for OnnxRecognizer {
         let input_data = preprocess_for_recognition(crop);
         let width = input_data.len() / (3 * 48);
 
-        let mut plans = self
-            .plans
-            .lock()
-            .map_err(|err| OcrError::Inference(format!("锁定识别 ONNX 计划缓存失败: {err}")))?;
-        if !plans.contains_key(&width) {
-            let plan = build_plan_from_proto(
-                &self.proto,
-                &[1, 3, 48, width],
-                &format!("rec[48x{width}]"),
-            )?;
-            plans.insert(width, plan);
-        }
-        let plan = plans
-            .get(&width)
-            .ok_or_else(|| OcrError::Inference("识别 ONNX 计划缓存缺失".to_string()))?;
-
-        let (flat, shape) = infer(plan, input_data, &[1, 3, 48, width])?;
+        let (flat, shape) = self.infer_batch(input_data, 1, width)?;
         let num_classes = self.decoder.num_classes();
 
         // 兼容不同输出格式：[T,C]、[1,T,C]、[1,C,T]
         let (data, output_classes) = normalize_rec_output(flat, &shape, num_classes)?;
         Ok(self.decoder.decode_probabilities(&data, output_classes))
+    }
+
+    fn recognize_batch(&self, crops: &[DynamicImage]) -> Vec<Result<(String, f32), OcrError>> {
+        if crops.is_empty() {
+            return Vec::new();
+        }
+
+        // 按宽度分组，使同宽样本能进同一个 batch 计划。
+        let mut groups: BTreeMap<usize, Vec<(usize, Vec<f32>)>> = BTreeMap::new();
+        for (index, crop) in crops.iter().enumerate() {
+            let input = preprocess_for_recognition(crop);
+            let width = input.len() / (3 * 48);
+            groups.entry(width).or_default().push((index, input));
+        }
+
+        let mut results: Vec<Option<Result<(String, f32), OcrError>>> =
+            std::iter::repeat_with(|| None).take(crops.len()).collect();
+        let dict_classes = self.decoder.num_classes();
+
+        for (width, group) in groups {
+            for chunk in group.chunks(crate::models::MAX_INFERENCE_BATCH) {
+                let batch_size = chunk.len();
+                let mut data = Vec::with_capacity(batch_size * 3 * 48 * width);
+                let mut indices = Vec::with_capacity(batch_size);
+                for (index, input) in chunk {
+                    indices.push(*index);
+                    data.extend_from_slice(input);
+                }
+
+                let decoded = self
+                    .infer_batch(data, batch_size, width)
+                    .and_then(|(flat, shape)| {
+                        split_batched_rec_output(&flat, &shape, batch_size, dict_classes)
+                    });
+
+                match decoded {
+                    Ok(samples) => {
+                        for (index, (sample, output_classes)) in indices.iter().zip(samples) {
+                            results[*index] =
+                                Some(Ok(self.decoder.decode_probabilities(&sample, output_classes)));
+                        }
+                    }
+                    Err(err) => {
+                        let message = err.to_string();
+                        for index in indices {
+                            results[index] = Some(Err(OcrError::Inference(message.clone())));
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(OcrError::Inference(
+                        "批量识别结果数量与输入数量不一致".to_string(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn name(&self) -> &str {
@@ -358,6 +432,48 @@ fn normalize_rec_output(
         let transposed = transpose_ct_to_tc(&flat, rows, cols);
         Ok((transposed, rows))
     }
+}
+
+/// 将批量识别输出 [N, rows, cols] 拆分为每个样本的 ([T*C] 序列, output_classes)。
+fn split_batched_rec_output(
+    flat: &[f32],
+    shape: &[usize],
+    batch_size: usize,
+    dict_classes: usize,
+) -> Result<Vec<(Vec<f32>, usize)>, OcrError> {
+    let (rows, cols) = match shape.len() {
+        3 if shape[0] == batch_size => (shape[1], shape[2]), // [N, T, C] 或 [N, C, T]
+        2 if batch_size == 1 => (shape[0], shape[1]),        // 部分模型在 batch=1 时省略 batch 维
+        _ => {
+            return Err(OcrError::Inference(format!(
+                "识别模型批量输出形状不支持: {shape:?}, batch={batch_size}"
+            )));
+        }
+    };
+
+    let sample_len = rows * cols;
+    if flat.len() < batch_size * sample_len {
+        return Err(OcrError::Inference(format!(
+            "识别模型批量输出数据不足: len={}, required={}, shape={shape:?}",
+            flat.len(),
+            batch_size * sample_len
+        )));
+    }
+
+    // cols 是类别维时为 [T, C]；否则 rows 是类别维，需转置为 [T, C]。
+    let class_major = !(cols >= rows || cols == dict_classes);
+    let mut samples = Vec::with_capacity(batch_size);
+    for batch_index in 0..batch_size {
+        let offset = batch_index * sample_len;
+        let slice = &flat[offset..offset + sample_len];
+        if class_major {
+            samples.push((transpose_ct_to_tc(slice, rows, cols), rows));
+        } else {
+            samples.push((slice.to_vec(), cols));
+        }
+    }
+
+    Ok(samples)
 }
 
 /// 将 [C, T] 格式转置为 [T, C] 格式

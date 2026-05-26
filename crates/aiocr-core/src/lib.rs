@@ -36,6 +36,13 @@ pub use types::{OcrResult as Result, TextRegion};
 pub trait Recognizer: Send + Sync {
     /// 识别裁剪的文本行图片
     fn recognize(&self, crop: &DynamicImage) -> std::result::Result<(String, f32), OcrError>;
+    /// 批量识别裁剪的文本行图片
+    fn recognize_batch(
+        &self,
+        crops: &[DynamicImage],
+    ) -> Vec<std::result::Result<(String, f32), OcrError>> {
+        crops.iter().map(|crop| self.recognize(crop)).collect()
+    }
     /// 识别器名称
     fn name(&self) -> &str;
 }
@@ -217,7 +224,8 @@ where
     };
     tracing::info!("检测到 {} 个文本区域", detections.len());
 
-    let mut regions = Vec::with_capacity(detections.len());
+    let mut crop_infos = Vec::with_capacity(detections.len());
+    let mut crops = Vec::with_capacity(detections.len());
 
     for (bbox, det_conf) in &detections {
         let crop_start = Instant::now();
@@ -231,34 +239,50 @@ where
         };
         timings.crop += crop_start.elapsed();
 
-        let classify_start = Instant::now();
-        let (direction, need_rotate) = match classifier.classify(&crop) {
-            Ok(classification) => classification,
-            Err(err) => {
-                tracing::warn!("方向分类失败，使用默认方向: {err}");
-                (types::TextDirection::Horizontal, false)
-            }
-        };
-        timings.classify += classify_start.elapsed();
+        crop_infos.push((*bbox, *det_conf));
+        crops.push(crop);
+    }
 
-        let recognize_start = Instant::now();
-        let crop = if need_rotate { crop.rotate180() } else { crop };
-        let (text, rec_conf) = match recognizer.recognize(&crop) {
+    let classify_start = Instant::now();
+    let classifications = match classifier.classify_batch(&crops) {
+        Ok(classifications) => classifications,
+        Err(err) => {
+            tracing::warn!("批量方向分类失败，使用默认方向: {err}");
+            vec![(types::TextDirection::Horizontal, false); crops.len()]
+        }
+    };
+    timings.classify += classify_start.elapsed();
+
+    let mut recognition_crops = Vec::with_capacity(crops.len());
+    for (crop, (_, need_rotate)) in crops.into_iter().zip(classifications.iter().copied()) {
+        recognition_crops.push(if need_rotate { crop.rotate180() } else { crop });
+    }
+
+    let recognize_start = Instant::now();
+    let recognition_results = recognizer.recognize_batch(&recognition_crops);
+    timings.recognize += recognize_start.elapsed();
+
+    let mut regions = Vec::with_capacity(crop_infos.len());
+
+    for (((bbox, det_conf), (direction, _)), recognition) in crop_infos
+        .into_iter()
+        .zip(classifications.into_iter())
+        .zip(recognition_results.into_iter())
+    {
+        let (text, rec_conf) = match recognition {
             Ok(recognition) => recognition,
             Err(err) => {
                 tracing::warn!("识别器 {} 处理区域失败: {err}", recognizer.name());
-                timings.recognize += recognize_start.elapsed();
                 continue;
             }
         };
-        timings.recognize += recognize_start.elapsed();
 
         if text.trim().is_empty() {
             continue;
         }
 
         regions.push(types::TextRegion {
-            bbox: *bbox,
+            bbox,
             confidence: det_conf * rec_conf,
             text,
             direction,

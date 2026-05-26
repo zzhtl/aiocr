@@ -10,6 +10,7 @@ const DETECTION_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const DETECTION_TARGET_SIZE: u32 = 512;
 const RECOGNITION_MIN_WIDTH: u32 = 48;
 const RECOGNITION_MAX_WIDTH: u32 = 1280;
+const RECOGNITION_WIDTH_BUCKET: u32 = 32;
 const TEXT_REGION_HORIZONTAL_PAD_RATIO: f32 = 0.02;
 const TEXT_REGION_VERTICAL_PAD_RATIO: f32 = 0.45;
 const TEXT_REGION_MIN_PAD: f32 = 2.0;
@@ -33,13 +34,7 @@ pub fn preprocess_for_detection(img: &DynamicImage) -> (Vec<f32>, ImageMeta) {
     let pad_x = (DETECTION_TARGET_SIZE - content_w) / 2;
     let pad_y = (DETECTION_TARGET_SIZE - content_h) / 2;
 
-    let source = img.to_rgb8();
-    let resized = image::imageops::resize(
-        &source,
-        content_w,
-        content_h,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let resized = resize_to_rgb(img, content_w, content_h);
     let mut canvas = image::RgbImage::from_pixel(
         DETECTION_TARGET_SIZE,
         DETECTION_TARGET_SIZE,
@@ -79,12 +74,36 @@ pub fn preprocess_for_classification(crop: &DynamicImage) -> Vec<f32> {
 /// 输入尺寸: [1, 3, 48, W]，W 根据宽高比动态计算
 pub fn preprocess_for_recognition(crop: &DynamicImage) -> Vec<f32> {
     let target_h = 48u32;
-    let ratio = crop.width() as f32 / crop.height() as f32;
-    let target_w = (target_h as f32 * ratio).round() as u32;
-    let target_w = target_w.clamp(RECOGNITION_MIN_WIDTH, RECOGNITION_MAX_WIDTH);
+    let (content_w, target_w) = recognition_target_widths(crop, target_h);
 
-    let resized = resize_to_rgb(crop, target_w, target_h);
-    normalize_rgb_to_nchw(&resized)
+    let resized = resize_to_rgb(crop, content_w, target_h);
+    if content_w == target_w {
+        return normalize_rgb_to_nchw(&resized);
+    }
+
+    // 分桶宽度大于内容宽度时，右侧用白色填充，保持文本宽高比不被横向拉伸。
+    let mut canvas = image::RgbImage::from_pixel(target_w, target_h, image::Rgb([255, 255, 255]));
+    image::imageops::replace(&mut canvas, &resized, 0, 0);
+    normalize_rgb_to_nchw(&canvas)
+}
+
+/// 返回 (按宽高比缩放后的内容宽度, 分桶对齐后的张量宽度)。
+fn recognition_target_widths(crop: &DynamicImage, target_h: u32) -> (u32, u32) {
+    let ratio = crop.width() as f32 / crop.height().max(1) as f32;
+    let content_w = ((target_h as f32 * ratio).round() as u32)
+        .clamp(RECOGNITION_MIN_WIDTH, RECOGNITION_MAX_WIDTH);
+    (content_w, bucket_width(content_w))
+}
+
+fn bucket_width(width: u32) -> u32 {
+    if width <= RECOGNITION_MIN_WIDTH || width >= RECOGNITION_MAX_WIDTH {
+        return width;
+    }
+
+    width
+        .div_ceil(RECOGNITION_WIDTH_BUCKET)
+        .saturating_mul(RECOGNITION_WIDTH_BUCKET)
+        .min(RECOGNITION_MAX_WIDTH)
 }
 
 pub(crate) fn denormalize_detection_channel(channel: usize, value: f32) -> f32 {
@@ -205,8 +224,15 @@ fn normalize_rgb_to_nchw_with_stats(
 }
 
 fn resize_to_rgb(img: &DynamicImage, width: u32, height: u32) -> image::RgbImage {
-    let rgb = img.to_rgb8();
-    image::imageops::resize(&rgb, width, height, image::imageops::FilterType::Lanczos3)
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            image::imageops::resize(rgb, width, height, image::imageops::FilterType::Lanczos3)
+        }
+        _ => {
+            let rgb = img.to_rgb8();
+            image::imageops::resize(&rgb, width, height, image::imageops::FilterType::Lanczos3)
+        }
+    }
 }
 
 fn background_luma(gray: &image::GrayImage) -> u8 {
@@ -311,6 +337,20 @@ mod tests {
         assert_eq!(
             preprocess_for_recognition(&wide).len(),
             3 * 48 * RECOGNITION_MAX_WIDTH as usize
+        );
+    }
+
+    #[test]
+    fn test_preprocess_for_recognition_buckets_target_width() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            97,
+            48,
+            image::Rgb([255, 255, 255]),
+        ));
+
+        assert_eq!(
+            preprocess_for_recognition(&img).len(),
+            3 * 48 * 128
         );
     }
 

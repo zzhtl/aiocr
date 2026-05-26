@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aiocr_core::types::OcrResult;
 use aiocr_train::{AiModelInfo, TrainingConfig, TrainingProgress};
@@ -15,9 +16,11 @@ pub struct AppState {
     /// 当前加载的图片路径
     pub image_path: Option<PathBuf>,
     /// 当前加载的图片数据
-    pub image_data: Option<image::DynamicImage>,
+    pub image_data: Option<Arc<image::DynamicImage>>,
     /// OCR 识别结果
     pub ocr_result: Option<OcrResult>,
+    /// OCR 版式文本缓存
+    pub spatial_text: Option<String>,
     /// 当前任务状态
     pub task_status: TaskStatus,
     /// 状态消息
@@ -137,6 +140,7 @@ impl Default for AppState {
             image_path: None,
             image_data: None,
             ocr_result: None,
+            spatial_text: None,
             task_status: TaskStatus::Idle,
             status_message: "就绪，可拖拽图片或按 Ctrl+V / Cmd+V 粘贴截图".to_string(),
             show_bboxes: true,

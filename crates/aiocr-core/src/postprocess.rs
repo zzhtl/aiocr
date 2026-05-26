@@ -25,40 +25,26 @@ pub fn db_postprocess(
 
     // 2. 连通域分析
     let labels = connected_components(&binary, width, height);
-    let num_labels = *labels.iter().max().unwrap_or(&0);
+    let components = collect_component_stats(&labels, prob_map, width, height);
 
     let mut results = Vec::new();
 
-    for label in 1..=num_labels {
+    for component in components.iter().skip(1) {
         if results.len() >= config.max_candidates {
             break;
         }
 
-        // 收集当前连通域的像素坐标
-        let mut points: Vec<[usize; 2]> = Vec::new();
-        let mut score_sum = 0.0f32;
-
-        for y in 0..height {
-            for x in 0..width {
-                let idx = y * width + x;
-                if labels[idx] == label {
-                    points.push([x, y]);
-                    score_sum += prob_map[idx];
-                }
-            }
-        }
-
-        if points.is_empty() {
+        if component.count == 0 {
             continue;
         }
 
-        let mean_score = score_sum / points.len() as f32;
+        let mean_score = component.score_sum / component.count as f32;
         if mean_score < config.box_threshold {
             continue;
         }
 
         // 3. 最小外接矩形
-        let bbox = min_bounding_rect(&points);
+        let bbox = component.bounding_box();
         if bbox.area() < 10.0 {
             continue;
         }
@@ -75,6 +61,75 @@ pub fn db_postprocess(
     sort_reading_order(&mut results);
 
     results
+}
+
+#[derive(Debug, Clone)]
+struct ComponentStats {
+    x_min: usize,
+    y_min: usize,
+    x_max: usize,
+    y_max: usize,
+    score_sum: f32,
+    count: usize,
+}
+
+impl Default for ComponentStats {
+    fn default() -> Self {
+        Self {
+            x_min: usize::MAX,
+            y_min: usize::MAX,
+            x_max: 0,
+            y_max: 0,
+            score_sum: 0.0,
+            count: 0,
+        }
+    }
+}
+
+impl ComponentStats {
+    fn add_pixel(&mut self, x: usize, y: usize, score: f32) {
+        self.x_min = self.x_min.min(x);
+        self.y_min = self.y_min.min(y);
+        self.x_max = self.x_max.max(x);
+        self.y_max = self.y_max.max(y);
+        self.score_sum += score;
+        self.count += 1;
+    }
+
+    fn bounding_box(&self) -> BoundingBox {
+        BoundingBox {
+            points: [
+                [self.x_min as f32, self.y_min as f32],
+                [self.x_max as f32, self.y_min as f32],
+                [self.x_max as f32, self.y_max as f32],
+                [self.x_min as f32, self.y_max as f32],
+            ],
+        }
+    }
+}
+
+fn collect_component_stats(
+    labels: &[u32],
+    prob_map: &[f32],
+    width: usize,
+    height: usize,
+) -> Vec<ComponentStats> {
+    let max_label = *labels.iter().max().unwrap_or(&0) as usize;
+    let mut components = vec![ComponentStats::default(); max_label + 1];
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let label = labels[idx] as usize;
+            if label == 0 {
+                continue;
+            }
+
+            components[label].add_pixel(x, y, prob_map[idx]);
+        }
+    }
+
+    components
 }
 
 /// 简单的连通域标记（4-连通）
@@ -132,30 +187,6 @@ fn find_root(equivalences: &[u32], mut label: u32) -> u32 {
         label = equivalences[label as usize];
     }
     label
-}
-
-/// 从点集计算最小外接矩形（轴对齐）
-fn min_bounding_rect(points: &[[usize; 2]]) -> BoundingBox {
-    let mut x_min = usize::MAX;
-    let mut y_min = usize::MAX;
-    let mut x_max = 0usize;
-    let mut y_max = 0usize;
-
-    for p in points {
-        x_min = x_min.min(p[0]);
-        y_min = y_min.min(p[1]);
-        x_max = x_max.max(p[0]);
-        y_max = y_max.max(p[1]);
-    }
-
-    BoundingBox {
-        points: [
-            [x_min as f32, y_min as f32],
-            [x_max as f32, y_min as f32],
-            [x_max as f32, y_max as f32],
-            [x_min as f32, y_max as f32],
-        ],
-    }
 }
 
 /// 扩展检测框（Unclip）

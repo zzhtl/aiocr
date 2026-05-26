@@ -1,4 +1,6 @@
 #[cfg(aiocr_has_generated_rec)]
+use std::collections::BTreeMap;
+#[cfg(aiocr_has_generated_rec)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -172,6 +174,8 @@ impl Trainer {
         }
 
         let (train_items, validation_items) = split_dataset(dataset.items());
+        let train_items = prepare_items(&train_items, true)?;
+        let validation_items = prepare_items(&validation_items, false)?;
         let total_batches = train_items
             .len()
             .div_ceil(self.config.batch_size.max(1))
@@ -216,37 +220,40 @@ impl Trainer {
                 let mut batch_loss = 0.0f32;
                 let mut batch_correct = 0usize;
 
-                for item in batch {
-                    let raw_image = load_image(&item.image_path)?;
-                    // 训练时应用数据增强提高泛化能力
-                    let image = crate::data::augment::augment(&raw_image);
-                    let input_data = preprocess_for_recognition(&image);
-                    let width = input_data.len() / (3 * 48);
+                for (width, group) in group_items_by_width(batch) {
+                    let batch_size = group.len();
+                    let mut input_data = Vec::with_capacity(batch_size * 3 * 48 * width);
+                    for item in &group {
+                        input_data.extend_from_slice(&item.input_data);
+                    }
+
                     let input = Tensor::<TrainBackend, 4>::from_data(
-                        TensorData::new(input_data, [1, 3, 48, width]),
+                        TensorData::new(input_data, [batch_size, 3, 48, width]),
                         &device,
                     );
 
                     let probabilities = normalize_prob_dims(model.forward(input))?;
                     let [_batch, time_steps, _classes] = probabilities.dims();
-                    let aligned_targets = build_aligned_targets(&item.label_indices, time_steps);
+                    let aligned_targets = build_aligned_targets_batch(&group, time_steps);
                     let indices = Tensor::<TrainBackend, 3, Int>::from_data(
-                        TensorData::new(aligned_targets, [1, time_steps, 1]),
+                        TensorData::new(aligned_targets, [batch_size, time_steps, 1]),
                         &device,
                     );
                     let gathered: Tensor<TrainBackend, 2> =
                         probabilities.clone().gather(2, indices).squeeze_dim(2);
                     let loss = gathered.clamp_min(1e-6).log().neg().mean();
                     let loss_value = loss.clone().into_scalar();
-                    let prediction = decode_output(decoder_ref(&decoder), probabilities)?;
+                    let predictions = decode_batch_output(decoder_ref(&decoder), probabilities)?;
 
-                    if prediction.0 == item.label_text {
-                        batch_correct += 1;
+                    for (item, prediction) in group.iter().zip(predictions) {
+                        if prediction.0 == item.label_text {
+                            batch_correct += 1;
+                        }
                     }
 
                     let grads = GradientsParams::from_grads(loss.backward(), &model);
                     model = optimizer.step(self.config.learning_rate, model, grads);
-                    batch_loss += loss_value;
+                    batch_loss += loss_value * batch_size as f32;
                 }
 
                 processed += batch.len();
@@ -328,6 +335,51 @@ struct BaseModelSpec {
 }
 
 #[cfg(aiocr_has_generated_rec)]
+struct PreparedOcrItem {
+    input_data: Vec<f32>,
+    width: usize,
+    label_indices: Vec<usize>,
+    label_text: String,
+}
+
+#[cfg(aiocr_has_generated_rec)]
+fn prepare_items(items: &[OcrItem], augment: bool) -> Result<Vec<PreparedOcrItem>, TrainError> {
+    let mut prepared = Vec::with_capacity(items.len());
+
+    for item in items {
+        let raw_image = load_image(&item.image_path)?;
+        let image = if augment {
+            crate::data::augment::augment(&raw_image)
+        } else {
+            raw_image
+        };
+        let input_data = preprocess_for_recognition(&image);
+        let width = input_data.len() / (3 * 48);
+        prepared.push(PreparedOcrItem {
+            input_data,
+            width,
+            label_indices: item.label_indices.clone(),
+            label_text: item.label_text.clone(),
+        });
+    }
+
+    Ok(prepared)
+}
+
+/// 验证阶段单次 forward 的最大样本数，限制激活内存峰值。
+#[cfg(aiocr_has_generated_rec)]
+const RECOGNITION_EVAL_BATCH: usize = 32;
+
+#[cfg(aiocr_has_generated_rec)]
+fn group_items_by_width(items: &[PreparedOcrItem]) -> BTreeMap<usize, Vec<&PreparedOcrItem>> {
+    let mut groups: BTreeMap<usize, Vec<&PreparedOcrItem>> = BTreeMap::new();
+    for item in items {
+        groups.entry(item.width).or_default().push(item);
+    }
+    groups
+}
+
+#[cfg(aiocr_has_generated_rec)]
 fn resolve_base_model(config: &TrainingConfig) -> Result<BaseModelSpec, TrainError> {
     if let Some(dir) = &config.base_model_dir {
         let model = AiModelInfo::load_from_dir(dir)?;
@@ -370,13 +422,6 @@ fn normalize_prob_dims<B: burn::tensor::backend::Backend>(
     probabilities: burn::prelude::Tensor<B, 3>,
 ) -> Result<burn::prelude::Tensor<B, 3>, TrainError> {
     let dims = probabilities.dims();
-    if dims[0] != 1 {
-        return Err(TrainError::Training(format!(
-            "识别模型输出 batch 维异常: {:?}",
-            dims
-        )));
-    }
-
     if dims[2] >= dims[1] {
         Ok(probabilities)
     } else {
@@ -405,24 +450,49 @@ fn build_aligned_targets(target: &[usize], time_steps: usize) -> Vec<i64> {
 }
 
 #[cfg(aiocr_has_generated_rec)]
-fn decode_output<B: burn::tensor::backend::Backend>(
+fn build_aligned_targets_batch(items: &[&PreparedOcrItem], time_steps: usize) -> Vec<i64> {
+    let mut aligned = Vec::with_capacity(items.len() * time_steps);
+    for item in items {
+        aligned.extend(build_aligned_targets(&item.label_indices, time_steps));
+    }
+    aligned
+}
+
+#[cfg(aiocr_has_generated_rec)]
+fn decode_batch_output<B: burn::tensor::backend::Backend>(
     decoder: &CtcDecoder,
     probabilities: burn::prelude::Tensor<B, 3>,
-) -> Result<(String, f32), TrainError> {
+) -> Result<Vec<(String, f32)>, TrainError> {
     let probabilities = normalize_prob_dims(probabilities)?;
-    let dims = probabilities.dims();
+    let [batch_size, time_steps, classes] = probabilities.dims();
+    let sample_len = time_steps * classes;
     let data = probabilities
         .into_data()
         .to_vec::<f32>()
         .map_err(|err| TrainError::Training(format!("导出识别输出失败: {err}")))?;
-    Ok(decoder.decode_probabilities(&data, dims[2]))
+
+    if data.len() < batch_size * sample_len {
+        return Err(TrainError::Training(format!(
+            "识别输出数据不足: len={}, required={}",
+            data.len(),
+            batch_size * sample_len
+        )));
+    }
+
+    let mut decoded = Vec::with_capacity(batch_size);
+    for batch_index in 0..batch_size {
+        let offset = batch_index * sample_len;
+        decoded.push(decoder.decode_probabilities(&data[offset..offset + sample_len], classes));
+    }
+
+    Ok(decoded)
 }
 
 #[cfg(aiocr_has_generated_rec)]
 fn evaluate_accuracy<B: burn::tensor::backend::Backend, M>(
     model: &M,
     decoder: &CtcDecoder,
-    items: &[OcrItem],
+    items: &[PreparedOcrItem],
 ) -> Result<f32, TrainError>
 where
     M: RecognizerForward<B>,
@@ -434,18 +504,26 @@ where
     let device = Default::default();
     let mut correct = 0usize;
 
-    for item in items {
-        let image = load_image(&item.image_path)?;
-        let input_data = preprocess_for_recognition(&image);
-        let width = input_data.len() / (3 * 48);
-        let input = burn::prelude::Tensor::<B, 4>::from_data(
-            burn::prelude::TensorData::new(input_data, [1, 3, 48, width]),
-            &device,
-        );
-        let probabilities = model.forward_recognizer(input);
-        let (prediction, _confidence) = decode_output(decoder, probabilities)?;
-        if prediction == item.label_text {
-            correct += 1;
+    for (width, group) in group_items_by_width(items) {
+        for chunk in group.chunks(RECOGNITION_EVAL_BATCH) {
+            let batch_size = chunk.len();
+            let mut input_data = Vec::with_capacity(batch_size * 3 * 48 * width);
+            for item in chunk {
+                input_data.extend_from_slice(&item.input_data);
+            }
+
+            let input = burn::prelude::Tensor::<B, 4>::from_data(
+                burn::prelude::TensorData::new(input_data, [batch_size, 3, 48, width]),
+                &device,
+            );
+            let probabilities = model.forward_recognizer(input);
+            let predictions = decode_batch_output(decoder, probabilities)?;
+
+            for (item, prediction) in chunk.iter().zip(predictions) {
+                if prediction.0 == item.label_text {
+                    correct += 1;
+                }
+            }
         }
     }
 

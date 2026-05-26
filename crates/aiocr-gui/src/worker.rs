@@ -143,14 +143,14 @@ impl Worker {
     }
 
     /// 执行 OCR 识别。
-    pub fn run_ocr(&self, image: image::DynamicImage, spec: EngineSpec) {
+    pub fn run_ocr(&self, image: Arc<image::DynamicImage>, spec: EngineSpec) {
         let sender = self.sender.clone();
         let ocr_engines = self.ocr_engines.clone();
         let spawn_result = std::thread::Builder::new()
             .name("aiocr-ocr-worker".to_string())
             .stack_size(OCR_THREAD_STACK_SIZE)
             .spawn(move || match get_or_build_engine(&ocr_engines, spec) {
-                Ok(engine) => match engine.run(&image) {
+                Ok(engine) => match engine.run(image.as_ref()) {
                     Ok(result) => {
                         let _ = sender.send(WorkerMessage::OcrComplete(result));
                     }

@@ -119,6 +119,80 @@ impl DirectionClassifier {
             Ok((direction, need_rotate))
         }
     }
+
+    /// 批量分类文本方向，减少多文本区域图片中的重复模型调用。
+    pub fn classify_batch(
+        &self,
+        crops: &[DynamicImage],
+    ) -> Result<Vec<(TextDirection, bool)>, OcrError> {
+        if crops.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[cfg(aiocr_has_cls)]
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|err| OcrError::Inference(format!("锁定方向分类模型状态失败: {err}")))?;
+            if runtime.is_none() {
+                *runtime = Some(BurnClassifierRuntime::load()?);
+            }
+            let runtime = runtime.as_ref().expect("runtime just initialized");
+
+            let mut results = Vec::with_capacity(crops.len());
+            for chunk in crops.chunks(crate::models::MAX_INFERENCE_BATCH) {
+                let batch_size = chunk.len();
+                let mut directions = Vec::with_capacity(batch_size);
+                let mut input = Vec::with_capacity(batch_size * 3 * 48 * 192);
+                for crop in chunk {
+                    let direction = if crop.height() > crop.width().saturating_mul(5) / 4 {
+                        TextDirection::Vertical
+                    } else {
+                        TextDirection::Horizontal
+                    };
+                    directions.push(direction);
+                    input.extend(preprocess_for_classification(crop));
+                }
+
+                let tensor = crate::models::nchw_tensor_owned(
+                    input,
+                    [batch_size, 3, 48, 192],
+                    &runtime.device,
+                );
+                let output = runtime.model.forward(tensor);
+                let dims = output.dims();
+                let data = crate::models::tensor_to_vec(output)?;
+
+                if dims != [batch_size, 2] || data.len() != batch_size * 2 {
+                    return Err(OcrError::Inference(format!(
+                        "方向分类模型批量输出形状异常: expected [{batch_size}, 2], got {:?}",
+                        dims
+                    )));
+                }
+
+                for (index, direction) in directions.into_iter().enumerate() {
+                    let offset = index * 2;
+                    let (label, confidence) = if data[offset] >= data[offset + 1] {
+                        (0usize, data[offset])
+                    } else {
+                        (1usize, data[offset + 1])
+                    };
+                    let need_rotate = direction == TextDirection::Horizontal
+                        && label == 1
+                        && confidence >= self.threshold.min(0.999);
+                    results.push((direction, need_rotate));
+                }
+            }
+
+            Ok(results)
+        }
+
+        #[cfg(not(aiocr_has_cls))]
+        {
+            crops.iter().map(|crop| self.classify(crop)).collect()
+        }
+    }
 }
 
 #[cfg(test)]

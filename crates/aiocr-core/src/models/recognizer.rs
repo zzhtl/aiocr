@@ -1,5 +1,7 @@
 #[cfg(aiocr_has_rec)]
 use burn::tensor::Bytes;
+#[cfg(aiocr_has_rec)]
+use std::collections::BTreeMap;
 use image::DynamicImage;
 use std::path::PathBuf;
 #[cfg(aiocr_has_rec)]
@@ -127,57 +129,23 @@ impl TextRecognizer {
 
             let input = preprocess_for_recognition(crop);
             let width = input.len() / (3 * 48);
-            let tensor = crate::models::nchw_tensor(&input, [1, 3, 48, width], &runtime.device);
+            let tensor = crate::models::nchw_tensor_owned(input, [1, 3, 48, width], &runtime.device);
             let output = runtime.model.forward(tensor);
             let dims = output.dims();
             let probabilities = crate::models::tensor_to_vec(output)?;
-            let dict_classes = self.decoder.num_classes();
 
-            if dims[0] != 1 {
-                return Err(OcrError::Inference(format!(
-                    "识别模型输出 batch 维异常: expected 1, got {:?}",
-                    dims
-                )));
-            }
+            let decoded = decode_batched_probabilities(
+                &self.decoder,
+                &probabilities,
+                dims,
+                1,
+                &self.logged_output_class_mismatch,
+            )?;
 
-            let (flattened, output_classes) = if dims[2] >= dims[1] {
-                (probabilities, dims[2])
-            } else {
-                (
-                    transpose_bct_to_btc(&probabilities, dims[1], dims[2]),
-                    dims[1],
-                )
-            };
-
-            if output_classes < dict_classes {
-                return Err(OcrError::Inference(format!(
-                    "识别模型输出类别数少于字典大小: output={:?}, dict_classes={dict_classes}",
-                    dims,
-                )));
-            }
-            if output_classes != dict_classes {
-                let extra_classes = output_classes - dict_classes;
-                if !self
-                    .logged_output_class_mismatch
-                    .swap(true, Ordering::Relaxed)
-                {
-                    if extra_classes == 1 {
-                        tracing::info!(
-                            "识别模型输出包含 1 个额外保留类，按兼容模式解码: output_classes={}, dict_classes={dict_classes}",
-                            output_classes,
-                        );
-                    } else {
-                        tracing::warn!(
-                            "识别模型输出类别数与字典不完全一致: output_classes={}, dict_classes={dict_classes}",
-                            output_classes,
-                        );
-                    }
-                }
-            }
-
-            Ok(self
-                .decoder
-                .decode_probabilities(&flattened, output_classes))
+            decoded
+                .into_iter()
+                .next()
+                .ok_or_else(|| OcrError::Inference("识别模型未返回结果".to_string()))
         }
 
         #[cfg(not(aiocr_has_rec))]
@@ -187,6 +155,109 @@ impl TextRecognizer {
                 crop.width(),
                 crop.height()
             )))
+        }
+    }
+
+    /// 批量识别裁剪的文本行图片。
+    pub fn recognize_batch(&self, crops: &[DynamicImage]) -> Vec<Result<(String, f32), OcrError>> {
+        #[cfg(aiocr_has_rec)]
+        {
+            if crops.is_empty() {
+                return Vec::new();
+            }
+
+            let mut runtime = match self.runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    return repeat_inference_error(
+                        crops.len(),
+                        format!("锁定识别模型状态失败: {err}"),
+                    );
+                }
+            };
+            if runtime.is_none() {
+                match self.load_runtime() {
+                    Ok(loaded) => *runtime = Some(loaded),
+                    Err(err) => return repeat_inference_error(crops.len(), err.to_string()),
+                }
+            }
+            let runtime = runtime.as_ref().expect("runtime just initialized");
+
+            let mut groups: BTreeMap<usize, Vec<(usize, Vec<f32>)>> = BTreeMap::new();
+            for (index, crop) in crops.iter().enumerate() {
+                let input = preprocess_for_recognition(crop);
+                let width = input.len() / (3 * 48);
+                groups.entry(width).or_default().push((index, input));
+            }
+
+            let mut results: Vec<Option<Result<(String, f32), OcrError>>> =
+                std::iter::repeat_with(|| None).take(crops.len()).collect();
+
+            for (width, group) in groups {
+                for chunk in group.chunks(crate::models::MAX_INFERENCE_BATCH) {
+                    let batch_size = chunk.len();
+                    let mut input = Vec::with_capacity(batch_size * 3 * 48 * width);
+                    let mut indices = Vec::with_capacity(batch_size);
+                    for (index, data) in chunk {
+                        indices.push(*index);
+                        input.extend_from_slice(data);
+                    }
+
+                    let tensor = crate::models::nchw_tensor_owned(
+                        input,
+                        [batch_size, 3, 48, width],
+                        &runtime.device,
+                    );
+                    let output = runtime.model.forward(tensor);
+                    let dims = output.dims();
+                    let probabilities = match crate::models::tensor_to_vec(output) {
+                        Ok(probabilities) => probabilities,
+                        Err(err) => {
+                            let message = err.to_string();
+                            for index in indices {
+                                results[index] = Some(Err(OcrError::Inference(message.clone())));
+                            }
+                            continue;
+                        }
+                    };
+
+                    match decode_batched_probabilities(
+                        &self.decoder,
+                        &probabilities,
+                        dims,
+                        batch_size,
+                        &self.logged_output_class_mismatch,
+                    ) {
+                        Ok(decoded) => {
+                            for (index, recognition) in indices.into_iter().zip(decoded) {
+                                results[index] = Some(Ok(recognition));
+                            }
+                        }
+                        Err(err) => {
+                            let message = err.to_string();
+                            for index in indices {
+                                results[index] = Some(Err(OcrError::Inference(message.clone())));
+                            }
+                        }
+                    }
+                }
+            }
+
+            results
+                .into_iter()
+                .map(|result| {
+                    result.unwrap_or_else(|| {
+                        Err(OcrError::Inference(
+                            "批量识别结果数量与输入数量不一致".to_string(),
+                        ))
+                    })
+                })
+                .collect()
+        }
+
+        #[cfg(not(aiocr_has_rec))]
+        {
+            crops.iter().map(|crop| self.recognize(crop)).collect()
         }
     }
 
@@ -214,13 +285,125 @@ impl Recognizer for TextRecognizer {
         TextRecognizer::recognize(self, crop)
     }
 
+    fn recognize_batch(&self, crops: &[DynamicImage]) -> Vec<Result<(String, f32), OcrError>> {
+        TextRecognizer::recognize_batch(self, crops)
+    }
+
     fn name(&self) -> &str {
         &self.model_name
     }
 }
 
 #[cfg(aiocr_has_rec)]
-fn transpose_bct_to_btc(values: &[f32], classes: usize, time_steps: usize) -> Vec<f32> {
+fn decode_batched_probabilities(
+    decoder: &CtcDecoder,
+    probabilities: &[f32],
+    dims: [usize; 3],
+    expected_batch: usize,
+    logged_output_class_mismatch: &AtomicBool,
+) -> Result<Vec<(String, f32)>, OcrError> {
+    if dims[0] != expected_batch {
+        return Err(OcrError::Inference(format!(
+            "识别模型批量输出 batch 维异常: expected {expected_batch}, got {:?}",
+            dims
+        )));
+    }
+
+    let dict_classes = decoder.num_classes();
+    let (time_steps, output_classes, layout) = if dims[2] >= dims[1] {
+        (dims[1], dims[2], RecOutputLayout::TimeMajor)
+    } else {
+        (dims[2], dims[1], RecOutputLayout::ClassMajor)
+    };
+
+    if output_classes < dict_classes {
+        return Err(OcrError::Inference(format!(
+            "识别模型输出类别数少于字典大小: output={:?}, dict_classes={dict_classes}",
+            dims,
+        )));
+    }
+    log_class_mismatch_once(output_classes, dict_classes, logged_output_class_mismatch);
+
+    let sample_len = time_steps * output_classes;
+    if probabilities.len() < expected_batch * sample_len {
+        return Err(OcrError::Inference(format!(
+            "识别模型输出数据不足: len={}, required={}, shape={dims:?}",
+            probabilities.len(),
+            expected_batch * sample_len
+        )));
+    }
+
+    let mut decoded = Vec::with_capacity(expected_batch);
+    for batch_index in 0..expected_batch {
+        let offset = batch_index * sample_len;
+        match layout {
+            RecOutputLayout::TimeMajor => {
+                decoded.push(decoder.decode_probabilities(
+                    &probabilities[offset..offset + sample_len],
+                    output_classes,
+                ));
+            }
+            RecOutputLayout::ClassMajor => {
+                let transposed = transpose_ct_to_tc(
+                    &probabilities[offset..offset + sample_len],
+                    output_classes,
+                    time_steps,
+                );
+                decoded.push(decoder.decode_probabilities(&transposed, output_classes));
+            }
+        }
+    }
+
+    Ok(decoded)
+}
+
+#[cfg(aiocr_has_rec)]
+#[derive(Debug, Clone, Copy)]
+enum RecOutputLayout {
+    TimeMajor,
+    ClassMajor,
+}
+
+#[cfg(aiocr_has_rec)]
+fn log_class_mismatch_once(
+    output_classes: usize,
+    dict_classes: usize,
+    logged_output_class_mismatch: &AtomicBool,
+) {
+    if output_classes == dict_classes {
+        return;
+    }
+
+    let extra_classes = output_classes - dict_classes;
+    if logged_output_class_mismatch.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if extra_classes == 1 {
+        tracing::info!(
+            "识别模型输出包含 1 个额外保留类，按兼容模式解码: output_classes={}, dict_classes={dict_classes}",
+            output_classes,
+        );
+    } else {
+        tracing::warn!(
+            "识别模型输出类别数与字典不完全一致: output_classes={}, dict_classes={dict_classes}",
+            output_classes,
+        );
+    }
+}
+
+#[cfg(aiocr_has_rec)]
+fn repeat_inference_error(
+    count: usize,
+    message: String,
+) -> Vec<Result<(String, f32), OcrError>> {
+    (0..count)
+        .map(|_| Err(OcrError::Inference(message.clone())))
+        .collect()
+}
+
+#[cfg(aiocr_has_rec)]
+fn transpose_ct_to_tc(values: &[f32], classes: usize, time_steps: usize) -> Vec<f32> {
     let mut transposed = vec![0.0f32; values.len()];
     for class_idx in 0..classes {
         for step in 0..time_steps {

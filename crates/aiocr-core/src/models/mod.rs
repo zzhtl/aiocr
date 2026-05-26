@@ -42,6 +42,9 @@ pub const fn has_generated_recognizer() -> bool {
 pub(crate) type BurnBackend = NdArray<f32>;
 pub(crate) type BurnDevice = <BurnBackend as Backend>::Device;
 
+/// 批量推理时单次 forward 的最大样本数，限制激活内存峰值。
+pub(crate) const MAX_INFERENCE_BATCH: usize = 32;
+
 pub(crate) fn default_device() -> BurnDevice {
     Default::default()
 }
@@ -51,7 +54,15 @@ pub(crate) fn nchw_tensor(
     shape: [usize; 4],
     device: &BurnDevice,
 ) -> Tensor<BurnBackend, 4> {
-    Tensor::from_data(TensorData::new(data.to_vec(), shape), device)
+    nchw_tensor_owned(data.to_vec(), shape, device)
+}
+
+pub(crate) fn nchw_tensor_owned(
+    data: Vec<f32>,
+    shape: [usize; 4],
+    device: &BurnDevice,
+) -> Tensor<BurnBackend, 4> {
+    Tensor::from_data(TensorData::new(data, shape), device)
 }
 
 pub(crate) fn tensor_to_vec<const D: usize>(

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 
+use aiocr_core::build_spatial_text;
 use eframe::egui;
 
 use crate::native;
@@ -77,6 +79,13 @@ impl AiocrApp {
                     self.set_image(ctx, img, Some(path), "图片加载完成");
                 }
                 WorkerMessage::OcrComplete(result) => {
+                    self.state.spatial_text = self.state.image_data.as_ref().map(|image| {
+                        build_spatial_text(
+                            &result.regions,
+                            image.width() as f32,
+                            image.height() as f32,
+                        )
+                    });
                     self.state.status_message = format!(
                         "识别完成: {} 个区域, {}ms",
                         result.regions.len(),
@@ -198,8 +207,9 @@ impl AiocrApp {
     ) {
         self.update_texture(ctx, &img);
         self.state.image_path = path;
-        self.state.image_data = Some(img);
+        self.state.image_data = Some(Arc::new(img));
         self.state.ocr_result = None;
+        self.state.spatial_text = None;
         self.state.task_status = TaskStatus::Idle;
         self.state.status_message = status.to_string();
     }
@@ -327,6 +337,7 @@ impl AiocrApp {
                     self.state.active_backend = EngineBackend::LocalAi;
                     self.state.status_message = format!("已切换识别模型: {model_name}");
                     self.state.ocr_result = None;
+                    self.state.spatial_text = None;
                 }
             }
         }
