@@ -2,6 +2,7 @@ mod app;
 mod native;
 mod panels;
 mod state;
+mod theme;
 mod widgets;
 mod worker;
 

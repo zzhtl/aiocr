@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aiocr_core::QualityPreset;
 use aiocr_core::types::OcrResult;
 use aiocr_train::{AiModelInfo, TrainingConfig, TrainingProgress};
+
+use crate::theme::ThemeMode;
 
 const DEFAULT_SERVER_DET_URL: &str =
     "https://huggingface.co/monkt/paddleocr-onnx/resolve/main/detection/v5/det.onnx";
@@ -35,6 +38,10 @@ pub struct AppState {
     pub onnx: OnnxState,
     /// 模型下载中心状态
     pub model_hub: ModelHubState,
+    /// 当前主题模式（跟随系统 / 浅色 / 深色）
+    pub theme_mode: ThemeMode,
+    /// 识别质量预设（快速 / 均衡 / 高精度）
+    pub quality_preset: QualityPreset,
 }
 
 /// 当前激活的 OCR 引擎后端
@@ -148,6 +155,8 @@ impl Default for AppState {
             active_backend: EngineBackend::default(),
             onnx: OnnxState::default(),
             model_hub: ModelHubState::default(),
+            theme_mode: ThemeMode::default(),
+            quality_preset: QualityPreset::default(),
         }
     }
 }

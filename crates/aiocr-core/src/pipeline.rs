@@ -16,17 +16,13 @@ pub struct OcrPipeline {
     detector: TextDetector,
     classifier: DirectionClassifier,
     recognizer: TextRecognizer,
+    rec_score_threshold: f32,
 }
 
 impl OcrPipeline {
     /// 从配置创建 OCR 管线
     pub fn new(config: &OcrConfig) -> Result<Self, OcrError> {
-        let detector = TextDetector::new(
-            config.det_threshold,
-            config.det_box_threshold,
-            config.det_max_candidates,
-            config.det_unclip_ratio,
-        )?;
+        let detector = TextDetector::new(config.detection_params())?;
 
         let classifier = DirectionClassifier::new(config.cls_threshold)?;
 
@@ -37,13 +33,19 @@ impl OcrPipeline {
             detector,
             classifier,
             recognizer,
+            rec_score_threshold: config.rec_score_threshold,
         })
     }
 
     /// 执行完整 OCR 流程
     pub fn run(&self, img: &DynamicImage) -> Result<OcrResult, OcrError> {
-        let (result, timings) =
-            run_ocr_flow(&self.detector, &self.classifier, &self.recognizer, img)?;
+        let (result, timings) = run_ocr_flow(
+            &self.detector,
+            &self.classifier,
+            &self.recognizer,
+            img,
+            self.rec_score_threshold,
+        )?;
         log_ocr_stage_timings(
             self.detector.name(),
             self.recognizer.name(),

@@ -1,9 +1,12 @@
 use image::DynamicImage;
 
 use crate::Detector;
+use crate::config::{DetectionParams, DetectionResize};
 use crate::error::OcrError;
 use crate::postprocess::{DbPostprocessConfig, db_postprocess};
-use crate::preprocess::{denormalize_detection_channel, preprocess_for_detection};
+use crate::preprocess::{
+    DETECTION_BURN_SQUARE_SIZE, denormalize_detection_channel, preprocess_for_detection,
+};
 use crate::types::BoundingBox;
 
 #[cfg(aiocr_has_det)]
@@ -32,14 +35,8 @@ impl BurnDetectorRuntime {
 /// 当 ONNX 模型可用时，优先使用 burn-onnx 生成的纯 Burn 模型。
 /// 在模型未生成时回退到纯 Rust 启发式检测。
 pub struct TextDetector {
-    /// 检测阈值
-    threshold: f32,
-    /// 框阈值
-    box_threshold: f32,
-    /// 最大候选数
-    max_candidates: usize,
-    /// 扩展比例
-    unclip_ratio: f32,
+    /// 检测/后处理参数
+    params: DetectionParams,
     #[cfg(aiocr_has_det)]
     runtime: std::sync::Mutex<Option<BurnDetectorRuntime>>,
 }
@@ -49,17 +46,9 @@ impl TextDetector {
         crate::models::has_generated_detector()
     }
 
-    pub fn new(
-        threshold: f32,
-        box_threshold: f32,
-        max_candidates: usize,
-        unclip_ratio: f32,
-    ) -> Result<Self, OcrError> {
+    pub fn new(params: DetectionParams) -> Result<Self, OcrError> {
         Ok(Self {
-            threshold,
-            box_threshold,
-            max_candidates,
-            unclip_ratio,
+            params,
             #[cfg(aiocr_has_det)]
             runtime: std::sync::Mutex::new(None),
         })
@@ -67,7 +56,9 @@ impl TextDetector {
 
     /// 检测图片中的文本区域
     pub fn detect(&self, img: &DynamicImage) -> Result<Vec<(BoundingBox, f32)>, OcrError> {
-        let (input_data, meta) = preprocess_for_detection(img);
+        // Burn 内嵌检测器编译期固定 512×512，强制走方形预处理（回退启发式同样可用）。
+        let (input_data, meta) =
+            preprocess_for_detection(img, DetectionResize::square(DETECTION_BURN_SQUARE_SIZE));
         let h = meta.resized_height as usize;
         let w = meta.resized_width as usize;
         let prob_map = self.run_inference(&input_data, h, w)?;
@@ -77,10 +68,12 @@ impl TextDetector {
             h,
             w,
             DbPostprocessConfig {
-                threshold: self.threshold,
-                box_threshold: self.box_threshold,
-                max_candidates: self.max_candidates,
-                unclip_ratio: self.unclip_ratio,
+                threshold: self.params.threshold,
+                box_threshold: self.params.box_threshold,
+                max_candidates: self.params.max_candidates,
+                unclip_ratio: self.params.unclip_ratio,
+                min_box_area: self.params.min_box_area,
+                box_mode: self.params.box_mode,
                 meta: &meta,
             },
         );
@@ -294,8 +287,15 @@ mod tests {
             }
         }
 
-        let detector = TextDetector::new(0.3, 0.4, 32, 1.2).unwrap();
-        let (input, meta) = preprocess_for_detection(&DynamicImage::ImageLuma8(image));
+        let detector = TextDetector::new(DetectionParams {
+            box_threshold: 0.4,
+            max_candidates: 32,
+            unclip_ratio: 1.2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (input, meta) =
+            preprocess_for_detection(&DynamicImage::ImageLuma8(image), DetectionResize::square(512));
         let result = detector
             .run_fallback_inference(
                 &input,
@@ -322,7 +322,13 @@ mod tests {
                     64,
                     image::Rgb([255, 255, 255]),
                 ));
-                let detector = TextDetector::new(0.3, 0.4, 32, 1.2).unwrap();
+                let detector = TextDetector::new(DetectionParams {
+            box_threshold: 0.4,
+            max_candidates: 32,
+            unclip_ratio: 1.2,
+            ..Default::default()
+        })
+        .unwrap();
                 let result = detector.detect(&image).unwrap();
                 assert!(result.len() <= 32);
             })

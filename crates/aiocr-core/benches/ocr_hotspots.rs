@@ -1,4 +1,5 @@
 use aiocr_core::build_spatial_text;
+use aiocr_core::config::{DetectionBoxMode, DetectionResize};
 use aiocr_core::postprocess::{DbPostprocessConfig, db_postprocess};
 use aiocr_core::preprocess::{preprocess_for_detection, preprocess_for_recognition};
 use aiocr_core::types::{BoundingBox, ImageMeta, TextDirection, TextRegion};
@@ -10,7 +11,8 @@ fn bench_detection_preprocess(c: &mut Criterion) {
 
     c.bench_function("preprocess_for_detection_1600x1000", |b| {
         b.iter(|| {
-            let output = preprocess_for_detection(black_box(&image));
+            let output =
+                preprocess_for_detection(black_box(&image), DetectionResize::limit_side(1600, false));
             black_box(output);
         });
     });
@@ -48,6 +50,8 @@ fn bench_db_postprocess(c: &mut Criterion) {
         box_threshold: 0.6,
         max_candidates: 256,
         unclip_ratio: 1.2,
+        min_box_area: 4.0,
+        box_mode: DetectionBoxMode::AxisAligned,
         meta: &meta,
     };
 

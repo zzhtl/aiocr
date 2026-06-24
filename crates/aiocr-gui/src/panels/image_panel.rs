@@ -20,12 +20,14 @@ pub fn show(ui: &mut Ui, state: &AppState, texture: Option<&egui::TextureHandle>
                 && let Some(result) = &state.ocr_result
             {
                 let painter = ui.painter_at(response.rect);
+                let bbox_color = crate::theme::accent(ui.visuals());
                 draw_bboxes(
                     &painter,
                     &response.rect,
                     &result.regions,
                     &display_size,
                     state,
+                    bbox_color,
                 );
             }
         } else {
@@ -43,6 +45,7 @@ fn draw_bboxes(
     regions: &[aiocr_core::types::TextRegion],
     display_size: &egui::Vec2,
     state: &AppState,
+    bbox_color: egui::Color32,
 ) {
     let Some(img) = &state.image_data else {
         return;
@@ -60,7 +63,7 @@ fn draw_bboxes(
             image_rect.min,
             scale_x,
             scale_y,
-            egui::Color32::from_rgb(0, 200, 0),
+            bbox_color,
         );
     }
 }

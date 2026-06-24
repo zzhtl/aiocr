@@ -29,17 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detector: Box<dyn Detector> = match det_backend.as_str() {
         "onnx" => Box::new(OnnxDetector::new(
             &models_dir.join("det.onnx"),
-            config.det_threshold,
-            config.det_box_threshold,
-            config.det_max_candidates,
-            config.det_unclip_ratio,
+            config.detection_params(),
         )?),
-        "burn" => Box::new(TextDetector::new(
-            config.det_threshold,
-            config.det_box_threshold,
-            config.det_max_candidates,
-            config.det_unclip_ratio,
-        )?),
+        "burn" => Box::new(TextDetector::new(config.detection_params())?),
         other => return Err(format!("unsupported detector backend: {other}").into()),
     };
     let classifier = DirectionClassifier::new(config.cls_threshold)?;

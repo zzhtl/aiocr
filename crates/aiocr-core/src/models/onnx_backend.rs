@@ -12,6 +12,7 @@ use tract_onnx::pb;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::framework::Framework;
 
+use crate::config::DetectionParams;
 use crate::decode::CtcDecoder;
 use crate::error::OcrError;
 use crate::postprocess::{DbPostprocessConfig, db_postprocess};
@@ -20,6 +21,9 @@ use crate::types::BoundingBox;
 use crate::{Detector, Recognizer};
 
 type OcrPlan = RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+
+/// 检测推理计划缓存上限（按 (h,w) 缓存，超出后清空重建，避免多尺寸图片累积占用内存）。
+const MAX_DET_PLAN_CACHE: usize = 8;
 
 /// 加载 ONNX 原始模型文件
 fn load_onnx_proto(path: &Path) -> Result<pb::ModelProto, OcrError> {
@@ -177,36 +181,25 @@ fn infer(
 pub struct OnnxDetector {
     proto: pb::ModelProto,
     plans: Mutex<HashMap<(usize, usize), OcrPlan>>,
-    threshold: f32,
-    box_threshold: f32,
-    max_candidates: usize,
-    unclip_ratio: f32,
+    params: DetectionParams,
 }
 
 impl OnnxDetector {
     /// 从 ONNX 模型文件创建检测器
-    pub fn new(
-        det_path: &Path,
-        threshold: f32,
-        box_threshold: f32,
-        max_candidates: usize,
-        unclip_ratio: f32,
-    ) -> Result<Self, OcrError> {
+    pub fn new(det_path: &Path, params: DetectionParams) -> Result<Self, OcrError> {
         tracing::info!("加载 ONNX 检测模型: {}", det_path.display());
         Ok(Self {
             proto: load_onnx_proto(det_path)?,
             plans: Mutex::new(HashMap::new()),
-            threshold,
-            box_threshold,
-            max_candidates,
-            unclip_ratio,
+            params,
         })
     }
 }
 
 impl Detector for OnnxDetector {
     fn detect(&self, img: &DynamicImage) -> Result<Vec<(BoundingBox, f32)>, OcrError> {
-        let (input_data, meta) = preprocess_for_detection(img);
+        // ONNX 检测器走 limit_side 动态尺寸（保宽高比 + 高分辨率），提升宽文档/小字召回。
+        let (input_data, meta) = preprocess_for_detection(img, self.params.resize);
         let h = meta.resized_height as usize;
         let w = meta.resized_width as usize;
 
@@ -216,6 +209,10 @@ impl Detector for OnnxDetector {
             .lock()
             .map_err(|err| OcrError::Inference(format!("锁定检测 ONNX 计划缓存失败: {err}")))?;
         if !plans.contains_key(&key) {
+            // limit_side 下不同尺寸图片会各自编译一份计划，限制缓存规模避免内存无限增长。
+            if plans.len() >= MAX_DET_PLAN_CACHE {
+                plans.clear();
+            }
             let plan = build_plan_from_proto(&self.proto, &[1, 3, h, w], &format!("det[{h}x{w}]"))?;
             plans.insert(key, plan);
         }
@@ -248,10 +245,12 @@ impl Detector for OnnxDetector {
             h,
             w,
             DbPostprocessConfig {
-                threshold: self.threshold,
-                box_threshold: self.box_threshold,
-                max_candidates: self.max_candidates,
-                unclip_ratio: self.unclip_ratio,
+                threshold: self.params.threshold,
+                box_threshold: self.params.box_threshold,
+                max_candidates: self.params.max_candidates,
+                unclip_ratio: self.params.unclip_ratio,
+                min_box_area: self.params.min_box_area,
+                box_mode: self.params.box_mode,
                 meta: &meta,
             },
         );

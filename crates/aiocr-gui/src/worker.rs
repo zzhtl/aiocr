@@ -8,7 +8,7 @@ use aiocr_core::decode::CtcDecoder;
 use aiocr_core::models::classifier::DirectionClassifier;
 use aiocr_core::models::detector::TextDetector;
 use aiocr_core::models::recognizer::TextRecognizer;
-use aiocr_core::{OcrConfig, OcrEngine, Recognizer};
+use aiocr_core::{OcrConfig, OcrEngine, QualityPreset, Recognizer};
 use aiocr_train::{
     AiModelInfo, Trainer, TrainingCallback, TrainingConfig, TrainingProgress, TrainingSummary,
     list_ai_models,
@@ -93,7 +93,7 @@ impl EngineSpec {
 pub struct Worker {
     sender: mpsc::Sender<WorkerMessage>,
     training_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    ocr_engines: Arc<Mutex<HashMap<EngineSpec, Arc<OcrEngine>>>>,
+    ocr_engines: Arc<Mutex<HashMap<(EngineSpec, QualityPreset), Arc<OcrEngine>>>>,
 }
 
 impl Worker {
@@ -143,13 +143,13 @@ impl Worker {
     }
 
     /// 执行 OCR 识别。
-    pub fn run_ocr(&self, image: Arc<image::DynamicImage>, spec: EngineSpec) {
+    pub fn run_ocr(&self, image: Arc<image::DynamicImage>, spec: EngineSpec, preset: QualityPreset) {
         let sender = self.sender.clone();
         let ocr_engines = self.ocr_engines.clone();
         let spawn_result = std::thread::Builder::new()
             .name("aiocr-ocr-worker".to_string())
             .stack_size(OCR_THREAD_STACK_SIZE)
-            .spawn(move || match get_or_build_engine(&ocr_engines, spec) {
+            .spawn(move || match get_or_build_engine(&ocr_engines, spec, preset) {
                 Ok(engine) => match engine.run(image.as_ref()) {
                     Ok(result) => {
                         let _ = sender.send(WorkerMessage::OcrComplete(result));
@@ -238,7 +238,7 @@ impl Worker {
     /// 清除指定 spec 的引擎缓存（模型文件变更后调用）。
     pub fn invalidate_onnx_cache(&self) {
         if let Ok(mut cache) = self.ocr_engines.lock() {
-            cache.retain(|k, _| !matches!(k, EngineSpec::Onnx { .. }));
+            cache.retain(|(spec, _), _| !matches!(spec, EngineSpec::Onnx { .. }));
         }
     }
 }
@@ -269,8 +269,8 @@ impl TrainingCallback for ChannelCallback {
     }
 }
 
-fn build_engine(spec: &EngineSpec) -> Result<OcrEngine, String> {
-    let config = OcrConfig::default();
+fn build_engine(spec: &EngineSpec, preset: QualityPreset) -> Result<OcrEngine, String> {
+    let config = OcrConfig::with_preset(preset);
 
     match spec {
         EngineSpec::Default => build_default_engine(&config),
@@ -289,13 +289,8 @@ fn build_default_engine(config: &OcrConfig) -> Result<OcrEngine, String> {
 
 fn build_local_ai_engine(config: &OcrConfig, model_dir: &PathBuf) -> Result<OcrEngine, String> {
     let detector = Box::new(
-        TextDetector::new(
-            config.det_threshold,
-            config.det_box_threshold,
-            config.det_max_candidates,
-            config.det_unclip_ratio,
-        )
-        .map_err(|err| format!("初始化检测器失败: {err}"))?,
+        TextDetector::new(config.detection_params())
+            .map_err(|err| format!("初始化检测器失败: {err}"))?,
     );
     let classifier = DirectionClassifier::new(config.cls_threshold)
         .map_err(|err| format!("初始化方向分类器失败: {err}"))?;
@@ -308,7 +303,8 @@ fn build_local_ai_engine(config: &OcrConfig, model_dir: &PathBuf) -> Result<OcrE
             .map_err(|err| format!("初始化 AI 识别模型失败: {err}"))?,
     );
 
-    Ok(OcrEngine::new(detector, classifier, recognizer))
+    Ok(OcrEngine::new(detector, classifier, recognizer)
+        .with_rec_score_threshold(config.rec_score_threshold))
 }
 
 fn build_onnx_engine(
@@ -329,27 +325,29 @@ fn build_onnx_engine(
 }
 
 fn get_or_build_engine(
-    cache: &Arc<Mutex<HashMap<EngineSpec, Arc<OcrEngine>>>>,
+    cache: &Arc<Mutex<HashMap<(EngineSpec, QualityPreset), Arc<OcrEngine>>>>,
     spec: EngineSpec,
+    preset: QualityPreset,
 ) -> Result<Arc<OcrEngine>, String> {
+    let key = (spec, preset);
     if let Ok(cache) = cache.lock()
-        && let Some(engine) = cache.get(&spec)
+        && let Some(engine) = cache.get(&key)
     {
-        tracing::debug!("复用 OCR 引擎缓存: {}", spec.display_name());
+        tracing::debug!("复用 OCR 引擎缓存: {} [{}]", key.0.display_name(), preset.display_name());
         return Ok(engine.clone());
     }
 
-    tracing::info!("初始化 OCR 引擎: {}", spec.display_name());
-    let engine = Arc::new(build_engine(&spec)?);
+    tracing::info!("初始化 OCR 引擎: {} [{}]", key.0.display_name(), preset.display_name());
+    let engine = Arc::new(build_engine(&key.0, preset)?);
 
     let mut cache = cache
         .lock()
         .map_err(|err| format!("锁定 OCR 引擎缓存失败: {err}"))?;
 
-    if let Some(existing) = cache.get(&spec) {
+    if let Some(existing) = cache.get(&key) {
         Ok(existing.clone())
     } else {
-        cache.insert(spec, engine.clone());
+        cache.insert(key, engine.clone());
         Ok(engine)
     }
 }

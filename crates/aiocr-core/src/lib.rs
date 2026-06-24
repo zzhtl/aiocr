@@ -27,7 +27,10 @@ use crate::models::recognizer::TextRecognizer;
 use crate::types::{BoundingBox, OcrResult};
 
 // 重导出核心类型
-pub use config::{OcrConfig, OnnxModelConfig as OcrOnnxConfig};
+pub use config::{
+    DetectionBoxMode, DetectionParams, DetectionResize, OcrConfig,
+    OnnxModelConfig as OcrOnnxConfig, QualityPreset,
+};
 pub use error::OcrError as Error;
 pub use pipeline::OcrPipeline;
 pub use types::{OcrResult as Result, TextRegion};
@@ -60,6 +63,8 @@ pub struct OcrEngine {
     detector: Box<dyn Detector>,
     classifier: DirectionClassifier,
     recognizer: Box<dyn Recognizer>,
+    /// 识别置信度阈值，低于此值的区域不进入版式文本（0 = 不过滤）。
+    rec_score_threshold: f32,
 }
 
 impl OcrEngine {
@@ -73,37 +78,29 @@ impl OcrEngine {
             detector,
             classifier,
             recognizer,
+            rec_score_threshold: 0.0,
         }
+    }
+
+    /// 设置识别置信度过滤阈值（0 = 不过滤）。
+    pub fn with_rec_score_threshold(mut self, threshold: f32) -> Self {
+        self.rec_score_threshold = threshold;
+        self
     }
 
     /// 通过默认 OCR 配置创建默认引擎
     pub fn from_config(config: &OcrConfig) -> std::result::Result<Self, OcrError> {
         let default_onnx = OnnxModelConfig::from_dir(&config.weights_dir);
+        let det_params = config.detection_params();
         let detector: Box<dyn Detector> = if let Some(det_path) = &default_onnx.det_path {
             tracing::info!("默认 OCR 检测使用 ONNX 模型: {}", det_path.display());
-            Box::new(OnnxDetector::new(
-                det_path,
-                config.det_threshold,
-                config.det_box_threshold,
-                config.det_max_candidates,
-                config.det_unclip_ratio,
-            )?)
+            Box::new(OnnxDetector::new(det_path, det_params)?)
         } else if TextDetector::generated_model_available() {
             tracing::warn!("models/ 下未找到 det.onnx，回退到 Burn 检测模型");
-            Box::new(TextDetector::new(
-                config.det_threshold,
-                config.det_box_threshold,
-                config.det_max_candidates,
-                config.det_unclip_ratio,
-            )?)
+            Box::new(TextDetector::new(det_params)?)
         } else {
             tracing::warn!("检测 ONNX 与 Burn 模型都不可用，回退到内置检测器");
-            Box::new(TextDetector::new(
-                config.det_threshold,
-                config.det_box_threshold,
-                config.det_max_candidates,
-                config.det_unclip_ratio,
-            )?)
+            Box::new(TextDetector::new(det_params)?)
         };
 
         let classifier = DirectionClassifier::new(config.cls_threshold)?;
@@ -127,7 +124,8 @@ impl OcrEngine {
             Box::new(TextRecognizer::new(decoder)?)
         };
 
-        Ok(Self::new(detector, classifier, recognizer))
+        Ok(Self::new(detector, classifier, recognizer)
+            .with_rec_score_threshold(config.rec_score_threshold))
     }
 
     /// 通过 ONNX 文件创建引擎（使用 tract-onnx 运行时）
@@ -138,22 +136,12 @@ impl OcrEngine {
         onnx: &OnnxModelConfig,
     ) -> std::result::Result<Self, OcrError> {
         // 检测器：优先使用 ONNX，否则回退到 Burn 内嵌
+        let det_params = base_config.detection_params();
         let detector: Box<dyn Detector> = if let Some(det_path) = &onnx.det_path {
-            Box::new(OnnxDetector::new(
-                det_path,
-                base_config.det_threshold,
-                base_config.det_box_threshold,
-                base_config.det_max_candidates,
-                base_config.det_unclip_ratio,
-            )?)
+            Box::new(OnnxDetector::new(det_path, det_params)?)
         } else {
             tracing::warn!("ONNX 检测模型未配置，回退到 Burn 内嵌模型");
-            Box::new(TextDetector::new(
-                base_config.det_threshold,
-                base_config.det_box_threshold,
-                base_config.det_max_candidates,
-                base_config.det_unclip_ratio,
-            )?)
+            Box::new(TextDetector::new(det_params)?)
         };
 
         // 方向分类器：始终使用 Burn 内嵌（cls 对效果影响有限）
@@ -170,13 +158,19 @@ impl OcrEngine {
             Box::new(TextRecognizer::new(decoder)?)
         };
 
-        Ok(Self::new(detector, classifier, recognizer))
+        Ok(Self::new(detector, classifier, recognizer)
+            .with_rec_score_threshold(base_config.rec_score_threshold))
     }
 
     /// 执行 OCR
     pub fn run(&self, img: &DynamicImage) -> std::result::Result<OcrResult, OcrError> {
-        let (result, timings) =
-            run_ocr_flow(&*self.detector, &self.classifier, &*self.recognizer, img)?;
+        let (result, timings) = run_ocr_flow(
+            &*self.detector,
+            &self.classifier,
+            &*self.recognizer,
+            img,
+            self.rec_score_threshold,
+        )?;
         log_ocr_stage_timings(
             self.detector.name(),
             self.recognizer.name(),
@@ -208,6 +202,7 @@ pub(crate) fn run_ocr_flow<D, R>(
     classifier: &DirectionClassifier,
     recognizer: &R,
     img: &DynamicImage,
+    rec_score_threshold: f32,
 ) -> std::result::Result<(OcrResult, OcrStageTimings), OcrError>
 where
     D: Detector + ?Sized,
@@ -290,7 +285,17 @@ where
     }
 
     let join_start = Instant::now();
-    let full_text = build_full_text(&regions);
+    // 低置信度区域不进入版式文本，但仍保留在 regions 供 GUI 高亮/调试。
+    let full_text = if rec_score_threshold > 0.0 {
+        let filtered: Vec<types::TextRegion> = regions
+            .iter()
+            .filter(|region| region.confidence >= rec_score_threshold)
+            .cloned()
+            .collect();
+        build_full_text(&filtered)
+    } else {
+        build_full_text(&regions)
+    };
     timings.join = join_start.elapsed();
 
     let result = OcrResult {
@@ -501,6 +506,352 @@ fn line_center_y(line: &[&types::TextRegion]) -> f32 {
         .map(|region| region.bbox.center_y())
         .sum::<f32>()
         / line.len().max(1) as f32
+}
+
+/// 版式文本入口：竖排为主时按竖排顺序，识别为表格时按列对齐，否则回退自由缩进版式。
+///
+/// 适配截图/网页/聊天/表格/票据等场景，让输出排版尽量贴近原图。
+pub fn build_layout_text(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    image_height: f32,
+) -> String {
+    if is_vertical_dominant(regions) {
+        return build_vertical_text(regions);
+    }
+    build_table_text(regions, image_width, image_height)
+        .unwrap_or_else(|| build_spatial_text(regions, image_width, image_height))
+}
+
+/// 行 × 列的表格网格，空单元格为空串。
+struct TableGrid {
+    rows: Vec<Vec<String>>,
+}
+
+/// 尝试把检测结果还原为列对齐的表格文本。
+///
+/// 适用于表格、票据、发票、聊天记录、KV 等有行列结构的图片。内容不像表格时返回 `None`，
+/// 由调用方回退到自由缩进的 `build_spatial_text`，避免把普通段落误判强排成网格。
+pub fn build_table_text(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    image_height: f32,
+) -> Option<String> {
+    detect_table_grid(regions, image_width, image_height).map(|table| render_table_monospace(&table))
+}
+
+/// 尝试把表格结果导出为 CSV（逗号分隔，含标准引号转义）。内容不像表格时返回 `None`。
+pub fn build_table_csv(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    image_height: f32,
+) -> Option<String> {
+    detect_table_grid(regions, image_width, image_height).map(|table| render_table_csv(&table))
+}
+
+fn detect_table_grid(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    image_height: f32,
+) -> Option<TableGrid> {
+    if regions.len() < 4 {
+        return None;
+    }
+
+    let row_groups = cluster_rows_by_y(regions);
+    if row_groups.len() < 2 {
+        return None;
+    }
+
+    let columns = cluster_column_edges(regions, image_width, image_height);
+    if columns.len() < 2 {
+        return None;
+    }
+
+    // 表格判定：至少两行各自落在 ≥2 个不同列，避免把单列段落误判为表格。
+    let multi_col_rows = row_groups
+        .iter()
+        .filter(|row| distinct_column_count(row, &columns) >= 2)
+        .count();
+    if multi_col_rows < 2 {
+        return None;
+    }
+
+    let mut rows = Vec::with_capacity(row_groups.len());
+    for row in &row_groups {
+        let mut cells = vec![String::new(); columns.len()];
+        for region in row {
+            let col = nearest_column_index(region.bbox.left(), &columns);
+            let cell = &mut cells[col];
+            let text = region.text.trim();
+            if cell.is_empty() {
+                cell.push_str(text);
+            } else {
+                cell.push(' ');
+                cell.push_str(text);
+            }
+        }
+        rows.push(cells);
+    }
+
+    Some(TableGrid { rows })
+}
+
+/// 全局按 y 中心聚行：比相邻比较更鲁棒，适配乱序/表格输入。
+fn cluster_rows_by_y(regions: &[types::TextRegion]) -> Vec<Vec<&types::TextRegion>> {
+    let mut sorted: Vec<&types::TextRegion> = regions.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.bbox
+            .center_y()
+            .partial_cmp(&b.bbox.center_y())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut rows: Vec<Vec<&types::TextRegion>> = Vec::new();
+    for region in sorted {
+        let placed = rows.last_mut().is_some_and(|row| {
+            let row_center =
+                row.iter().map(|r| r.bbox.center_y()).sum::<f32>() / row.len() as f32;
+            let avg_height =
+                row.iter().map(|r| r.bbox.height()).sum::<f32>() / row.len() as f32;
+            let tol = avg_height.max(region.bbox.height()) * 0.6;
+            if (region.bbox.center_y() - row_center).abs() <= tol {
+                row.push(region);
+                true
+            } else {
+                false
+            }
+        });
+        if !placed {
+            rows.push(vec![region]);
+        }
+    }
+
+    for row in &mut rows {
+        row.sort_by(|a, b| {
+            a.bbox
+                .left()
+                .partial_cmp(&b.bbox.left())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    rows
+}
+
+/// 对所有 region 的左边缘做 1D 聚类，得到列起始位置。
+fn cluster_column_edges(
+    regions: &[types::TextRegion],
+    image_width: f32,
+    _image_height: f32,
+) -> Vec<f32> {
+    let mut lefts: Vec<f32> = regions.iter().map(|r| r.bbox.left()).collect();
+    lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 同列左边缘聚得很紧，列间距远大于字高；容差取字高量级。
+    let tol = (median_region_height(regions) * 1.2)
+        .max(image_width * 0.01)
+        .max(4.0);
+
+    let mut columns = Vec::new();
+    let mut cluster_sum = 0.0f32;
+    let mut cluster_count = 0u32;
+    let mut cluster_last = f32::NEG_INFINITY;
+    for x in lefts {
+        if cluster_count == 0 || x - cluster_last <= tol {
+            cluster_sum += x;
+            cluster_count += 1;
+        } else {
+            columns.push(cluster_sum / cluster_count as f32);
+            cluster_sum = x;
+            cluster_count = 1;
+        }
+        cluster_last = x;
+    }
+    if cluster_count > 0 {
+        columns.push(cluster_sum / cluster_count as f32);
+    }
+    columns
+}
+
+fn distinct_column_count(row: &[&types::TextRegion], columns: &[f32]) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    for region in row {
+        seen.insert(nearest_column_index(region.bbox.left(), columns));
+    }
+    seen.len()
+}
+
+fn nearest_column_index(x: f32, columns: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_dist = f32::MAX;
+    for (index, &col) in columns.iter().enumerate() {
+        let dist = (x - col).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = index;
+        }
+    }
+    best
+}
+
+fn median_region_height(regions: &[types::TextRegion]) -> f32 {
+    let mut heights: Vec<f32> = regions
+        .iter()
+        .map(|r| r.bbox.height())
+        .filter(|h| *h > 0.0)
+        .collect();
+    if heights.is_empty() {
+        return 1.0;
+    }
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights[heights.len() / 2]
+}
+
+/// 按每列最大显示宽度对齐渲染（CJK 字符按 2 列宽计算）。
+fn render_table_monospace(table: &TableGrid) -> String {
+    let col_count = table.rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return String::new();
+    }
+
+    let mut col_width = vec![0usize; col_count];
+    for row in &table.rows {
+        for (index, cell) in row.iter().enumerate() {
+            col_width[index] = col_width[index].max(display_width(cell));
+        }
+    }
+
+    const GAP: usize = 2;
+    let mut col_start = vec![0usize; col_count];
+    for index in 1..col_count {
+        col_start[index] = col_start[index - 1] + col_width[index - 1] + GAP;
+    }
+
+    let mut out = String::new();
+    for (row_index, row) in table.rows.iter().enumerate() {
+        if row_index > 0 {
+            out.push('\n');
+        }
+        let mut cursor = 0usize;
+        for (col_index, cell) in row.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            while cursor < col_start[col_index] {
+                out.push(' ');
+                cursor += 1;
+            }
+            out.push_str(cell);
+            cursor += display_width(cell);
+        }
+        while out.ends_with(' ') {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn render_table_csv(table: &TableGrid) -> String {
+    let mut out = String::new();
+    for (row_index, row) in table.rows.iter().enumerate() {
+        if row_index > 0 {
+            out.push('\n');
+        }
+        for (col_index, cell) in row.iter().enumerate() {
+            if col_index > 0 {
+                out.push(',');
+            }
+            out.push_str(&csv_escape(cell));
+        }
+    }
+    out
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// 文本显示宽度估算：CJK / 全角字符按 2 列宽，其余按 1 列宽。
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    let cp = ch as u32;
+    let wide = (0x1100..=0x115F).contains(&cp)      // Hangul Jamo
+        || (0x2E80..=0xA4CF).contains(&cp)          // CJK 部首 .. 彝文
+        || (0xAC00..=0xD7A3).contains(&cp)          // Hangul 音节
+        || (0xF900..=0xFAFF).contains(&cp)          // CJK 兼容表意
+        || (0xFE30..=0xFE4F).contains(&cp)          // CJK 兼容形式
+        || (0xFF00..=0xFF60).contains(&cp)          // 全角 ASCII
+        || (0xFFE0..=0xFFE6).contains(&cp)          // 全角符号
+        || (0x1F300..=0x1FAFF).contains(&cp)        // emoji
+        || (0x20000..=0x3FFFD).contains(&cp); // CJK 扩展
+    if wide { 2 } else { 1 }
+}
+
+/// 整图是否以竖排文本为主（默认横排，仅在多数 region 为竖排时启用竖排顺序）。
+fn is_vertical_dominant(regions: &[types::TextRegion]) -> bool {
+    if regions.len() < 2 {
+        return false;
+    }
+    let vertical = regions
+        .iter()
+        .filter(|r| r.direction == types::TextDirection::Vertical)
+        .count();
+    vertical * 2 > regions.len()
+}
+
+/// 竖排阅读顺序：列从右到左，列内从上到下；每列输出为一行。
+fn build_vertical_text(regions: &[types::TextRegion]) -> String {
+    let mut columns: Vec<Vec<&types::TextRegion>> = Vec::new();
+    let mut sorted: Vec<&types::TextRegion> = regions.iter().collect();
+    // 先按 center_x 降序（右列优先）。
+    sorted.sort_by(|a, b| {
+        b.bbox
+            .center_x()
+            .partial_cmp(&a.bbox.center_x())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for region in sorted {
+        let placed = columns.last_mut().is_some_and(|col| {
+            let col_center =
+                col.iter().map(|r| r.bbox.center_x()).sum::<f32>() / col.len() as f32;
+            let avg_width = col.iter().map(|r| r.bbox.width()).sum::<f32>() / col.len() as f32;
+            let tol = avg_width.max(region.bbox.width()) * 0.6;
+            if (region.bbox.center_x() - col_center).abs() <= tol {
+                col.push(region);
+                true
+            } else {
+                false
+            }
+        });
+        if !placed {
+            columns.push(vec![region]);
+        }
+    }
+
+    let mut out = String::new();
+    for (col_index, mut col) in columns.into_iter().enumerate() {
+        col.sort_by(|a, b| {
+            a.bbox
+                .top()
+                .partial_cmp(&b.bbox.top())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if col_index > 0 {
+            out.push('\n');
+        }
+        for region in col {
+            out.push_str(region.text.trim());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -751,6 +1102,10 @@ fn is_likely_gutter_box(bbox: &BoundingBox, image_width: f32, gutter_right: f32)
 }
 
 fn should_merge_detections(left: &BoundingBox, right: &BoundingBox) -> bool {
+    // 旋转框合并会经 union 退化为 AABB 丢失旋转信息，故仅合并近水平的轴对齐框。
+    if !left.is_axis_aligned() || !right.is_axis_aligned() {
+        return false;
+    }
     if !shares_text_line(left, right) {
         return false;
     }
@@ -1029,5 +1384,68 @@ mod tests {
         ];
 
         assert_eq!(detect_line_numbering_start(&lines, 4), Some(1));
+    }
+
+    fn region(text: &str, x: f32, y: f32, w: f32, h: f32, dir: TextDirection) -> TextRegion {
+        TextRegion {
+            bbox: BoundingBox::from_rect(x, y, w, h),
+            confidence: 0.9,
+            text: text.to_string(),
+            direction: dir,
+        }
+    }
+
+    fn table_regions() -> Vec<TextRegion> {
+        vec![
+            region("姓名", 20.0, 10.0, 40.0, 12.0, TextDirection::Horizontal),
+            region("金额", 180.0, 10.0, 60.0, 12.0, TextDirection::Horizontal),
+            region("张三", 20.0, 40.0, 40.0, 12.0, TextDirection::Horizontal),
+            region("100", 180.0, 40.0, 40.0, 12.0, TextDirection::Horizontal),
+            region("李四", 22.0, 70.0, 40.0, 12.0, TextDirection::Horizontal),
+            region("2000", 182.0, 70.0, 50.0, 12.0, TextDirection::Horizontal),
+        ]
+    }
+
+    #[test]
+    fn test_build_table_text_aligns_columns() {
+        let regions = table_regions();
+        let text = build_table_text(&regions, 260.0, 100.0).expect("应识别为表格");
+
+        assert_eq!(text, "姓名  金额\n张三  100\n李四  2000");
+    }
+
+    #[test]
+    fn test_build_table_csv_emits_rows() {
+        let regions = table_regions();
+        let csv = build_table_csv(&regions, 260.0, 100.0).expect("应识别为表格");
+
+        assert_eq!(csv, "姓名,金额\n张三,100\n李四,2000");
+    }
+
+    #[test]
+    fn test_build_table_text_returns_none_for_single_column_prose() {
+        let regions = vec![
+            region("第一行普通段落", 20.0, 10.0, 200.0, 12.0, TextDirection::Horizontal),
+            region("第二行普通段落", 20.0, 34.0, 210.0, 12.0, TextDirection::Horizontal),
+            region("第三行普通段落", 20.0, 58.0, 180.0, 12.0, TextDirection::Horizontal),
+            region("第四行普通段落", 20.0, 82.0, 220.0, 12.0, TextDirection::Horizontal),
+        ];
+
+        assert!(build_table_text(&regions, 260.0, 120.0).is_none());
+    }
+
+    #[test]
+    fn test_build_layout_text_uses_vertical_order_when_dominant() {
+        // 两列竖排：右列 x≈106 先读，列内从上到下；左列 x≈26 后读。
+        let regions = vec![
+            region("上", 100.0, 10.0, 12.0, 24.0, TextDirection::Vertical),
+            region("下", 100.0, 40.0, 12.0, 24.0, TextDirection::Vertical),
+            region("左", 20.0, 10.0, 12.0, 24.0, TextDirection::Vertical),
+            region("右", 20.0, 40.0, 12.0, 24.0, TextDirection::Vertical),
+        ];
+
+        let text = build_layout_text(&regions, 140.0, 80.0);
+
+        assert_eq!(text, "上下\n左右");
     }
 }

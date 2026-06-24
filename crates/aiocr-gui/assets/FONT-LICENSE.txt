@@ -1,0 +1,3 @@
+本目录字体为内置兜底中文字体：
+fallback-cjk.ttf = Droid Sans Fallback Full（Apache License 2.0）
+用于在系统缺少中文字体时保证界面中文正常显示。

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use aiocr_core::build_spatial_text;
+use aiocr_core::build_layout_text;
 use eframe::egui;
 
 use crate::native;
@@ -10,6 +10,7 @@ use crate::panels::{
     control_panel, image_panel, model_hub_panel, result_panel, toolbar, training_panel,
 };
 use crate::state::{AppState, DownloadStatus, EngineBackend, TaskStatus};
+use crate::theme;
 use crate::worker::{DirectoryKind, EngineSpec, Worker, WorkerMessage};
 
 const PASTE_IMAGE_SHORTCUT: egui::KeyboardShortcut =
@@ -39,6 +40,7 @@ impl AiocrApp {
 
         let (sender, receiver) = mpsc::channel();
         let state = AppState::default();
+        theme::install(&cc.egui_ctx, state.theme_mode);
         let worker = Worker::new(sender);
         worker.refresh_models(state.training.config.artifact_dir.clone());
 
@@ -80,7 +82,7 @@ impl AiocrApp {
                 }
                 WorkerMessage::OcrComplete(result) => {
                     self.state.spatial_text = self.state.image_data.as_ref().map(|image| {
-                        build_spatial_text(
+                        build_layout_text(
                             &result.regions,
                             image.width() as f32,
                             image.height() as f32,
@@ -223,7 +225,7 @@ impl AiocrApp {
             self.state.task_status = TaskStatus::Recognizing;
             self.state.status_message = "识别中...".to_string();
             let spec = self.current_engine_spec();
-            self.worker.run_ocr(image, spec);
+            self.worker.run_ocr(image, spec, self.state.quality_preset);
         }
     }
 
@@ -258,6 +260,10 @@ impl AiocrApp {
             }
             toolbar::ToolbarAction::StartOcr => {
                 self.start_ocr();
+            }
+            toolbar::ToolbarAction::ToggleTheme => {
+                self.state.theme_mode = self.state.theme_mode.next();
+                theme::install(ctx, self.state.theme_mode);
             }
             toolbar::ToolbarAction::None => {}
         }
@@ -352,6 +358,11 @@ impl AiocrApp {
             control_panel::ControlAction::PickOnnxDir => {
                 self.worker
                     .pick_directory(DirectoryKind::OnnxModel, self.state.onnx.model_dir.clone());
+            }
+            control_panel::ControlAction::SetPreset(preset) => {
+                self.state.quality_preset = preset;
+                self.state.status_message =
+                    format!("识别质量已设为：{}，重新识别后生效", preset.display_name());
             }
         }
     }

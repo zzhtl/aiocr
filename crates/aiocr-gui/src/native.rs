@@ -5,29 +5,39 @@ use std::sync::Arc;
 use eframe::egui;
 
 const SYSTEM_CJK_FONT_NAME: &str = "system-cjk";
+const BUNDLED_CJK_FONT_NAME: &str = "bundled-cjk";
 const SEARCH_DEPTH_LIMIT: usize = 4;
+
+/// 内置兜底中文字体（Droid Sans Fallback Full，Apache-2.0），保证无系统字体时中文也能显示。
+const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/fallback-cjk.ttf");
 
 pub fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    match load_system_cjk_font() {
-        Some((path, bytes)) => {
-            fonts.font_data.insert(
-                SYSTEM_CJK_FONT_NAME.to_string(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
+    // 内置兜底中文字体：始终注册为最后备选，保证中文必显（不再硬依赖系统字体）。
+    fonts.font_data.insert(
+        BUNDLED_CJK_FONT_NAME.to_string(),
+        Arc::new(egui::FontData::from_static(BUNDLED_CJK_FONT)),
+    );
 
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                family.insert(0, SYSTEM_CJK_FONT_NAME.to_string());
-            }
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                family.push(SYSTEM_CJK_FONT_NAME.to_string());
-            }
+    // 系统中文字体：找到则优先使用（字形更贴近平台、渲染更佳）。
+    let system_font = load_system_cjk_font();
+    if let Some((path, bytes)) = &system_font {
+        fonts.font_data.insert(
+            SYSTEM_CJK_FONT_NAME.to_string(),
+            Arc::new(egui::FontData::from_owned(bytes.clone())),
+        );
+        tracing::info!("加载系统中文字体: {}", path.display());
+    } else {
+        tracing::info!("未找到系统中文字体，使用内置兜底中文字体");
+    }
 
-            tracing::info!("加载系统中文字体: {}", path.display());
-        }
-        None => {
-            tracing::warn!("未找到可用的系统中文字体，界面中文可能显示为方块");
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            if system_font.is_some() {
+                list.insert(0, SYSTEM_CJK_FONT_NAME.to_string());
+            }
+            list.push(BUNDLED_CJK_FONT_NAME.to_string());
         }
     }
 

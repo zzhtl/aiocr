@@ -1,6 +1,8 @@
+use aiocr_core::QualityPreset;
 use egui::Ui;
 
 use crate::state::{AppState, EngineBackend};
+use crate::theme;
 
 /// 控制面板动作
 pub enum ControlAction {
@@ -9,6 +11,8 @@ pub enum ControlAction {
     SwitchBackend(EngineBackend),
     /// 选择 ONNX 模型目录
     PickOnnxDir,
+    /// 切换识别质量预设
+    SetPreset(QualityPreset),
 }
 
 /// 控制面板：显示当前模型状态，支持切换引擎后端
@@ -16,28 +20,48 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> ControlAction {
     let mut action = ControlAction::None;
 
     ui.heading("识别设置");
-    ui.checkbox(&mut state.show_bboxes, "显示检测框");
-    ui.separator();
+    ui.add_space(2.0);
 
-    // 模型后端选择
-    ui.label("识别引擎:");
+    // 识别质量预设
+    ui.label("识别质量:");
     ui.horizontal(|ui| {
-        let backends = [
-            EngineBackend::BurnDefault,
-            EngineBackend::Onnx,
-            EngineBackend::LocalAi,
-        ];
-        for backend in &backends {
-            let selected = &state.active_backend == backend;
+        for preset in [
+            QualityPreset::Fast,
+            QualityPreset::Balanced,
+            QualityPreset::High,
+        ] {
+            let selected = state.quality_preset == preset;
             if ui
-                .selectable_label(selected, backend.display_name())
+                .selectable_label(selected, preset.display_name())
+                .on_hover_text(preset_hint(preset))
                 .clicked()
                 && !selected
             {
-                action = ControlAction::SwitchBackend(backend.clone());
+                action = ControlAction::SetPreset(preset);
             }
         }
     });
+
+    ui.add_space(4.0);
+    ui.checkbox(&mut state.show_bboxes, "显示检测框");
+    ui.separator();
+
+    // 模型后端选择（纵向排列，避免长文本换行）
+    ui.label("识别引擎:");
+    for backend in [
+        EngineBackend::BurnDefault,
+        EngineBackend::Onnx,
+        EngineBackend::LocalAi,
+    ] {
+        let selected = state.active_backend == backend;
+        if ui
+            .selectable_label(selected, backend.display_name())
+            .clicked()
+            && !selected
+        {
+            action = ControlAction::SwitchBackend(backend);
+        }
+    }
 
     ui.separator();
 
@@ -154,18 +178,26 @@ fn show_onnx_config(ui: &mut Ui, state: &AppState) -> ControlAction {
                 "需要包含 det.onnx 和 rec.onnx 的目录。\n建议优先使用 PP-OCRv5 Server ONNX，或将官方 Paddle Inference 模型导出为 ONNX。"
             )
             .small()
-            .color(egui::Color32::YELLOW),
+            .color(theme::warning(ui.visuals())),
         );
     } else {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new("ONNX 模型已就绪")
                 .small()
-                .color(egui::Color32::GREEN),
+                .color(theme::success(ui.visuals())),
         );
     }
 
     action
+}
+
+fn preset_hint(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::Fast => "较低检测分辨率，优先速度",
+        QualityPreset::Balanced => "兼顾速度与精度",
+        QualityPreset::High => "较高检测分辨率，优先识别效果（较慢）",
+    }
 }
 
 fn show_local_ai_info(ui: &mut Ui, state: &AppState) {

@@ -2,6 +2,7 @@ use aiocr_core::types::TextDirection;
 use egui::{RichText, ScrollArea, TextEdit, Ui};
 
 use crate::state::AppState;
+use crate::theme;
 
 const MIN_FULL_TEXT_HEIGHT: f32 = 180.0;
 const MAX_FULL_TEXT_HEIGHT: f32 = 320.0;
@@ -80,11 +81,16 @@ pub fn show(ui: &mut Ui, state: &AppState) {
             .max_height(detail_list_height)
             .show(ui, |ui| {
                 for (i, region) in result.regions.iter().enumerate() {
-                    ui.group(|ui| {
+                    theme::card_frame(ui.visuals()).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.strong(format!("#{}", i + 1));
                             ui.separator();
-                            ui.label(format!("置信度 {:.0}%", region.confidence * 100.0));
+                            let badge = theme::confidence_color(ui.visuals(), region.confidence);
+                            ui.label(
+                                RichText::new(format!("{:.0}%", region.confidence * 100.0))
+                                    .color(badge)
+                                    .strong(),
+                            );
                             ui.separator();
                             ui.label(direction_label(region.direction));
                         });

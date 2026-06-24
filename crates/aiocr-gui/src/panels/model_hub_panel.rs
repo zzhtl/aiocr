@@ -160,14 +160,14 @@ fn show_download_status(ui: &mut Ui, hub: &ModelHubState) {
             ui.separator();
             ui.label(
                 egui::RichText::new("✓ 下载完成，已自动切换到外部 ONNX 推理引擎")
-                    .color(egui::Color32::from_rgb(80, 200, 80)),
+                    .color(crate::theme::success(ui.visuals())),
             );
         }
         DownloadStatus::Error(err) => {
             ui.separator();
             ui.label(
                 egui::RichText::new(format!("✗ 下载失败: {err}"))
-                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                    .color(crate::theme::error(ui.visuals())),
             );
         }
     }

@@ -99,6 +99,18 @@ impl BoundingBox {
         (rect[1] + rect[3]) * 0.5
     }
 
+    /// 是否近似轴对齐（顶边近水平、左边近垂直，约 ±2.3° 容差内）。
+    ///
+    /// 轴对齐框走快速 AABB 裁剪；旋转框走透视裁剪。
+    pub fn is_axis_aligned(&self) -> bool {
+        let p = &self.points;
+        let top = [p[1][0] - p[0][0], p[1][1] - p[0][1]];
+        let left = [p[3][0] - p[0][0], p[3][1] - p[0][1]];
+        let near_horizontal = top[1].abs() <= top[0].abs().max(1.0) * 0.04;
+        let near_vertical = left[0].abs() <= left[1].abs().max(1.0) * 0.04;
+        near_horizontal && near_vertical
+    }
+
     /// 与另一个边界框求并集。
     pub fn union(&self, other: &Self) -> Self {
         let rect_a = self.to_rect();
